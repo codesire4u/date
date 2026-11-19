@@ -330,7 +330,8 @@ service cloud.firestore {
           && request.resource.data.roomId is string
           && matchedInRoom(uid, request.resource.data.roomId)));
 
-      allow delete: if signedIn() && me() == uid;
+      allow delete: if signedIn() && (me() == uid
+        || (canLobby() && resource.data.pingAt < request.time - duration.value(3, 'm')));
     }
 
     match /rooms/{roomId} {

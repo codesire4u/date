@@ -1,14 +1,4 @@
 {
-  "indexes": [
-    {
-      "collectionGroup": "waiting",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "gender", "order": "ASCENDING" },
-        { "fieldPath": "status", "order": "ASCENDING" },
-        { "fieldPath": "pingAt", "order": "ASCENDING" }
-      ]
-    }
-  ],
+  "indexes": [],
   "fieldOverrides": []
 }

@@ -108,3 +108,8 @@ Things to know:
 - Anonymous accounts are cheap to create, so guests can be used for spam or to scrape the Online list (name, city, age, bio of whoever is online). Enable **App Check**, and if abuse appears, remove `guestOk()` from the `users` rules or from the conversation rules.
 - Guests don't appear in the Online list (they have no presence record); they start chats with members.
 - A banned guest is cut off everywhere at once, but can start a new guest session (see the guest limitations above).
+
+## Troubleshooting blind chat
+The searching screen now shows a status line. "Setup needed ... index" means run `firebase deploy --only firestore` and wait until **Firestore > Indexes** says *Enabled*. "Setup needed ... rules" means the rules were not published. Test with **two different accounts, one male and one female** (the same account on two devices has the same user id and can never match with itself). Matching measures freshness against your own server timestamp, so a wrong phone clock no longer hides people.
+
+**Update:** matching no longer needs any composite index (it uses two equality filters and checks freshness in the browser), so `firebase deploy --only firestore` only has to publish the rules. If the console still lists the old `waiting` index you can delete it. Abandoned queue entries older than 3 minutes can be tidied by any member in good standing.

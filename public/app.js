@@ -643,7 +643,7 @@ async function pageChat(uid) {
 // Queue lives in Firestore (`waiting/{uid}`). Whoever searches claims one fresh, opposite-gender entry plus their
 // own in a single transaction and creates a room. Firestore rules enforce the opposite-gender pairing.
 const oppositeOf = (g) => (g === "male" ? "female" : "male");
-const WAIT_FRESH_MS = 60 * 1000, WAIT_PING_MS = 20 * 1000, WAIT_TRY_MS = 4000;
+const WAIT_FRESH_MS = 75 * 1000, WAIT_PING_MS = 20 * 1000, WAIT_TRY_MS = 4000;
 const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 
 async function pageRandom() {
@@ -668,7 +668,7 @@ async function pageRandom() {
   const myWait = doc(db, "waiting", user.uid);
   const wantLabel = self.gender === "male" ? "a woman" : "a man";
   const strangerLabel = self.gender === "male" ? "Woman" : "Man";
-  let searching = false, matching = false, entering = false, room = null;   // room = { id, other, ended }
+  let searching = false, matching = false, entering = false, room = null, myPing = 0;   // room = { id, other, ended }
   let pingT = null, tryT = null, unsubWait = null, unsubRoom = null, unsubMsgs = null, blocked = new Set();
 
   const stopSearch = async () => {
@@ -703,6 +703,8 @@ async function pageRandom() {
   const showSearching = () => {
     render(`<div class="card narrow" style="text-align:center"><h2><span class="pulse"></span>Looking for ${wantLabel}…</h2>
       <p class="muted">Keep this page open. We'll connect you the moment someone of the opposite gender is waiting.</p>
+      <p class="muted" id="sstat">Connecting to the queue…</p>
+      <p class="muted" style="font-size:.75rem">blind chat build 5</p>
       <button class="ghost" id="cancel">Cancel</button></div>`);
     el("cancel").onclick = async () => { await stopSearch(); showIdle(); bindIdle(); };
   };
@@ -777,15 +779,28 @@ async function pageRandom() {
     showRoom();
   };
 
+  const setStat = (t) => { const x = el("sstat"); if (x) x.textContent = t; };
   const tryMatch = async () => {
     if (matching || !searching || room) return;
     matching = true;
     try {
-      const cutoff = Timestamp.fromMillis(Date.now() - WAIT_FRESH_MS);
+      // Two equality filters only: no composite index needed. Freshness is checked here, against MY
+      // server-stamped ping when I have it, so a wrong phone clock can't hide people.
       const snap = await getDocs(query(collection(db, "waiting"),
-        where("gender", "==", oppositeOf(self.gender)), where("status", "==", "waiting"),
-        where("pingAt", ">=", cutoff), orderBy("pingAt", "asc"), limit(10)));
-      const cands = shuffle(snap.docs.map((d) => d.id).filter((id) => id !== user.uid && !blocked.has(id)));
+        where("gender", "==", oppositeOf(self.gender)), where("status", "==", "waiting"), limit(50)));
+      const ref = myPing || Date.now();
+      const fresh = [];
+      snap.docs.forEach((d) => {
+        const t = d.data().pingAt && d.data().pingAt.toMillis ? d.data().pingAt.toMillis() : 0;
+        if (!t) return;
+        if (t >= ref - WAIT_FRESH_MS) fresh.push(d.id);
+        else if (t < ref - 180000) deleteDoc(d.ref).catch(() => {});   // tidy abandoned entries
+      });
+      const cands = shuffle(fresh.filter((id) => id !== user.uid && !blocked.has(id)));
+      const hhmm = new Date().toLocaleTimeString();
+      setStat(cands.length
+        ? `${cands.length} waiting, connecting… (${hhmm})`
+        : `Connected. Opposite-gender entries seen: ${snap.size}, active now: ${fresh.length} (checked ${hhmm}). Ask your partner to open Random too.`);
       for (const other of cands) {
         if (!searching) return;
         const theirs = doc(db, "waiting", other), roomRef = doc(collection(db, "rooms"));
@@ -798,10 +813,25 @@ async function pageRandom() {
           tx.update(myWait, { status: "matched", roomId: roomRef.id });
           tx.update(theirs, { status: "matched", roomId: roomRef.id });
           return true;
-        }).catch(() => false);
+        }).catch((e) => {
+          console.error(e);
+          const c = e && e.code ? e.code : "";
+          setStat(c === "permission-denied"
+            ? "Found someone but the security rules refused the match. Publish the latest firestore.rules (all of it) and try again."
+            : `Match attempt failed: ${c || e.message}`);
+          return false;
+        });
         if (won) return;                                  // my queue listener enters the room
       }
-    } catch (err) { console.error(err); }
+    } catch (err) {
+      console.error(err);
+      const c = err && err.code ? err.code : "";
+      setStat(c === "failed-precondition"
+        ? "Setup needed: the matching index isn't ready. Run `firebase deploy --only firestore` and wait 2-3 minutes (Firebase console > Firestore > Indexes must say Enabled)."
+        : c === "permission-denied"
+        ? "Setup needed: the new security rules aren't published. Run `firebase deploy --only firestore`."
+        : `Matching error: ${c || err.message}`);
+    }
     finally { matching = false; }
   };
 
@@ -818,14 +848,23 @@ async function pageRandom() {
       if (!searching) return;                             // cancelled while writing
       unsubWait = onSnapshot(myWait, (snap) => {
         const d = snap.data();
+        if (d && d.pingAt && d.pingAt.toMillis) myPing = d.pingAt.toMillis();
         if (d && d.status === "matched" && d.roomId) enterRoom(d.roomId);
+        else if (d && myPing && searching) tryMatch();
+      }, (err) => {
+        console.error(err);
+        setStat(err && err.code === "permission-denied"
+          ? "Setup needed: the queue rules aren't published. Run `firebase deploy --only firestore` (or paste firestore.rules in the console and Publish)."
+          : `Queue error: ${(err && err.code) || err.message}`);
       });
+      myPing = 0;
       pingT = setInterval(() => { updateDoc(myWait, { pingAt: serverTimestamp() }).catch(() => {}); }, WAIT_PING_MS);
       tryT = setInterval(tryMatch, WAIT_TRY_MS);
-      tryMatch();
     } catch (err) {
       searching = false;
-      showIdle(friendly(err));
+      showIdle(err && err.code === "permission-denied"
+        ? "Setup needed: the new security rules aren't published yet. Run `firebase deploy --only firestore`."
+        : friendly(err));
       bindIdle();
     }
   }
