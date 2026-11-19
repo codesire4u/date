@@ -63,8 +63,10 @@ service cloud.firestore {
     }
 
     match /users/{uid} {
-      allow get: if signedIn() && (me() == uid || isAdmin() || active());
-      allow list: if isAdmin() || active();
+      allow get: if signedIn() && (me() == uid || isAdmin() || active() || guestOk());
+      // Guests may only list members who are online right now (the Online page); Discover stays members-only.
+      allow list: if isAdmin() || active()
+        || (guestOk() && resource.data.lastSeen > request.time - duration.value(10, 'm'));
 
       allow create: if signedIn() && me() == uid
         && request.resource.data.keys().hasOnly(['name', 'dob', 'gender', 'lookingFor', 'city', 'bio',
@@ -187,18 +189,18 @@ service cloud.firestore {
 
     match /conversations/{convId} {
       // Metadata only (who talked, when). Message text is never stored here.
-      allow read: if isAdmin() || (active() && me() in resource.data.participants);
-      allow create: if active() && validConvId(convId)
+      allow read: if isAdmin() || (canLobby() && me() in resource.data.participants);
+      allow create: if canLobby() && validConvId(convId)
         && validConvFields(request.resource.data, convId)
         && notBlocked(convId);
-      allow update: if active() && me() in resource.data.participants
+      allow update: if canLobby() && me() in resource.data.participants
         && validConvFields(request.resource.data, convId)
         && notBlocked(convId);
       allow delete: if false;
 
       match /messages/{msgId} {
-        allow read: if (active() && validConvId(convId)) || adminGranted(convId);
-        allow create: if active() && validConvId(convId) && notBlocked(convId)
+        allow read: if (canLobby() && validConvId(convId)) || adminGranted(convId);
+        allow create: if canLobby() && validConvId(convId) && notBlocked(convId)
           && request.resource.data.keys().hasOnly(['senderId', 'body', 'createdAt'])
           && request.resource.data.senderId == me()
           && request.resource.data.body is string
@@ -213,7 +215,8 @@ service cloud.firestore {
       allow get: if signedIn() && (me() == uid || isAdmin());
       allow list: if isAdmin();
       allow create: if isGuest() && me() == uid
-        && request.resource.data.keys().hasOnly(['nickname', 'dob', 'adultConfirmed', 'consentAt', 'createdAt', 'banned'])
+        && request.resource.data.keys().hasOnly(['nickname', 'gender', 'dob', 'adultConfirmed', 'consentAt', 'createdAt', 'banned'])
+        && request.resource.data.gender in ['male', 'female']
         && request.resource.data.nickname is string
         && request.resource.data.nickname.size() >= 2 && request.resource.data.nickname.size() <= 20
         && request.resource.data.dob is timestamp
@@ -222,9 +225,25 @@ service cloud.firestore {
         && request.resource.data.consentAt == request.time
         && request.resource.data.createdAt == request.time
         && request.resource.data.banned == false;
-      allow update: if isAdmin()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['banned']);
+      allow update: if (isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['banned']))
+        // sessions created before gender existed may set it once
+        || (isGuest() && me() == uid && resource.data.banned == false
+          && !('gender' in resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['gender'])
+          && request.resource.data.gender in ['male', 'female']);
       allow delete: if false;
+    }
+
+    // Public part of a guest (nickname only, never the date of birth), so members can see who messaged them.
+    match /guestNames/{uid} {
+      allow get: if signedIn() && (me() == uid || isAdmin() || canLobby());
+      allow list: if false;
+      allow create: if isGuest() && me() == uid
+        && request.resource.data.keys().hasOnly(['nickname'])
+        && request.resource.data.nickname is string
+        && request.resource.data.nickname == getAfter(/databases/$(database)/documents/guests/$(me())).data.nickname;
+      allow update, delete: if false;
     }
 
     // Written together with every lobby post; used to enforce a 3-second gap between posts.
@@ -256,7 +275,11 @@ service cloud.firestore {
     // Members wait in `waiting/{uid}`. Another member of the OPPOSITE gender claims two waiting
     // entries and creates a room in one transaction. Rules enforce the pairing: both entries must be
     // fresh, still "waiting", and of different genders (gender is copied from the profile on create).
-    function myGender() { return get(/databases/$(database)/documents/users/$(me())).data.gender; }
+    function myGender() {
+      return isGuest()
+        ? get(/databases/$(database)/documents/guests/$(me())).data.gender
+        : get(/databases/$(database)/documents/users/$(me())).data.gender;
+    }
     function waitingPath(u) { return /databases/$(database)/documents/waiting/$(u); }
 
     function validPair(roomId, p) {
@@ -283,18 +306,18 @@ service cloud.firestore {
 
     match /waiting/{uid} {
       // You can read your own entry; you can only see entries of the opposite gender that are waiting.
-      allow read: if active() && (me() == uid
+      allow read: if canLobby() && (me() == uid
         || (resource.data.status == 'waiting'
             && resource.data.gender == (myGender() == 'male' ? 'female' : 'male')));
 
-      allow create: if active() && me() == uid
+      allow create: if canLobby() && me() == uid
         && request.resource.data.keys().hasOnly(['gender', 'status', 'roomId', 'pingAt'])
         && request.resource.data.gender == myGender()
         && request.resource.data.status == 'waiting'
         && request.resource.data.roomId == null
         && request.resource.data.pingAt == request.time;
 
-      allow update: if active() && (
+      allow update: if canLobby() && (
         // keep-alive ping by the owner
         (me() == uid
           && resource.data.status == 'waiting'
@@ -311,8 +334,8 @@ service cloud.firestore {
     }
 
     match /rooms/{roomId} {
-      allow read: if isAdmin() || (active() && me() in resource.data.participants);
-      allow create: if active()
+      allow read: if isAdmin() || (canLobby() && me() in resource.data.participants);
+      allow create: if canLobby()
         && request.resource.data.keys().hasOnly(['participants', 'createdAt', 'ended'])
         && request.resource.data.participants.size() == 2
         && request.resource.data.participants[0] != request.resource.data.participants[1]
@@ -321,15 +344,15 @@ service cloud.firestore {
         && request.resource.data.ended == false
         && validPair(roomId, request.resource.data.participants);
       // either person can hang up; it can never be undone
-      allow update: if active() && me() in resource.data.participants
+      allow update: if canLobby() && me() in resource.data.participants
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ended'])
         && request.resource.data.ended == true;
       allow delete: if false;
 
       match /messages/{msgId} {
-        allow read: if (active() && me() in get(/databases/$(database)/documents/rooms/$(roomId)).data.participants)
+        allow read: if (canLobby() && me() in get(/databases/$(database)/documents/rooms/$(roomId)).data.participants)
           || adminGranted(roomId);
-        allow create: if active()
+        allow create: if canLobby()
           && me() in get(/databases/$(database)/documents/rooms/$(roomId)).data.participants
           && get(/databases/$(database)/documents/rooms/$(roomId)).data.ended == false
           && request.resource.data.keys().hasOnly(['senderId', 'body', 'createdAt'])

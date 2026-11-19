@@ -94,3 +94,17 @@ Limits to know about:
 - A tab that crashes can leave a stale waiting entry for up to 60 s; the partner just taps *Next*.
 - Free-plan cost: about 3 writes/min while searching plus 1 per message. Rooms and messages are kept for moderation, so prune old `rooms` occasionally.
 - Gender matching uses the gender on the member's profile (strictly male <-> female), ignoring the "looking for" setting.
+
+## Guests can use everything except Discover
+Guests (anonymous sign-in, nickname + gender + 18+ date of birth, no email) can now use **Lobby, Online, Blind chat and private Messages**. **Discover** (browsing all profiles) stays members-only.
+
+- Guest sign-up now asks for **gender**, which blind chat needs. Guest sessions created earlier are asked once when they open Random.
+- New `guestNames/{uid}` document holds only the nickname, so members can see who messaged them without ever seeing a guest's date of birth.
+- Rules: guests (not banned) pass the same `canLobby()` check as members for blind chat and private conversations. They can open one profile by id and list only members who are online right now (last 10 minutes), never the whole member list.
+- Guests cannot use the Block button (it needs a member account), but they can report. Members can block guests from the chat page.
+- **After updating:** `firebase deploy --only firestore`.
+
+Things to know:
+- Anonymous accounts are cheap to create, so guests can be used for spam or to scrape the Online list (name, city, age, bio of whoever is online). Enable **App Check**, and if abuse appears, remove `guestOk()` from the `users` rules or from the conversation rules.
+- Guests don't appear in the Online list (they have no presence record); they start chats with members.
+- A banned guest is cut off everywhere at once, but can start a new guest session (see the guest limitations above).

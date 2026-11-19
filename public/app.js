@@ -95,7 +95,8 @@ async function nameOf(uid) {
       const s = await getDoc(doc(db, "users", uid));
       if (s.exists()) nameCache[uid] = s.data().name;
       else {
-        const g = await getDoc(doc(db, "guests", uid));
+        let g = await getDoc(doc(db, "guestNames", uid));
+        if (!g.exists() && claims.admin) g = await getDoc(doc(db, "guests", uid));
         nameCache[uid] = g.exists() ? `${g.data().nickname} (guest)` : "(deleted)";
       }
     } catch (_) { nameCache[uid] = "(unavailable)"; }
@@ -138,7 +139,7 @@ function requireVerified() {
   if (!requireLogin()) return false;
   if (user.isAnonymous) {
     render(`<div class="card narrow"><h2>Members only</h2>
-      <p>Guests can use the public lobby. Create a free account to browse profiles and send private messages.</p>
+      <p>Guests can use the lobby, the online list, blind chat and messages. Discover (browsing all profiles) is for members: create a free account to unlock it.</p>
       <p><a class="btn" href="#/register">Sign up</a> <a class="btn ghost" href="#/lobby">Back to lobby</a></p></div>`);
     return false;
   }
@@ -146,9 +147,20 @@ function requireVerified() {
   return true;
 }
 
+// Pages that guests may use too (everything except Discover).
+function requireChatter() {
+  if (!requireLogin()) return false;
+  if (user.isAnonymous) {
+    if (!guest) { go("#/guest"); return false; }
+    return true;
+  }
+  return requireVerified();
+}
+const selfRecord = () => (user.isAnonymous ? guest : profile);
+
 function renderNav() {
   el("nav").innerHTML = user && user.isAnonymous
-    ? `<a href="#/lobby">Lobby</a><a class="btn" href="#/register">Sign up</a><button class="ghost" id="logout">Leave</button>`
+    ? `<a href="#/random">Random</a><a href="#/online">Online</a><a href="#/lobby">Lobby</a><a href="#/chat">Messages</a><a class="btn" href="#/register">Sign up</a><button class="ghost" id="logout">Leave</button>`
     : user
     ? `<a href="#/browse">Discover</a><a href="#/random">Random</a><a href="#/online">Online</a><a href="#/lobby">Lobby</a><a href="#/chat">Messages</a>${claims.admin ? '<a href="#/admin">Admin</a>' : ""}<button class="ghost" id="logout">Log out</button>`
     : `<a href="#/login">Log in</a><a class="btn" href="#/register">Join</a>`;
@@ -217,7 +229,7 @@ function pageTerms() {
     <li>Everything must be consensual. Harassment, pressure, threats, or sharing someone's content without permission lead to a ban.</li>
     <li>No payment solicitation, scams, escorting or commercial sex offers, and no illegal content.</li>
     <li><b>Message moderation:</b> private messages are not end-to-end encrypted. Authorised moderators may review a conversation to investigate reports, enforce these rules and keep members safe. Each access requires a written reason and is recorded in an audit log.</li>
-    <li><b>Guest chat:</b> guests may use only the public lobby (no profiles or private messages), must confirm they are 18+, and are bound by the same rules and moderation. Lobby messages are visible to all guests and members.</li>
+    <li><b>Guest chat:</b> guests may use the public lobby, the online list, blind chat and private messages (not Discover), must confirm they are 18+, and are bound by the same rules and moderation. Lobby messages are visible to all guests and members.</li>
     <li>We store your email, profile details and messages to run the service. Your email is never shown to other members.</li>
     <li><b>Blind chat:</b> random chat pairs you with an anonymous member of the opposite gender. Names are hidden in the chat, but these conversations are stored and may be reviewed by moderators like any other message. Harassment or pressure ends with a ban.</li>
     <li><b>Online status:</b> other members can see that you are online, and your city, while you have the site open. Turn this off any time with \"Show me as online\" on the Online page.</li>
@@ -431,33 +443,37 @@ async function pageBrowse() {
 }
 
 async function pageOnline() {
-  if (!requireVerified()) return;
-  if (!profile) return render('<div class="card"><p>No member profile found for this account.</p></div>');
+  if (!requireChatter()) return;
+  const isGuest = user.isAnonymous;
+  const me = isGuest ? {} : profile;
+  if (!isGuest && !profile) return render('<div class="card"><p>No member profile found for this account.</p></div>');
   render(`<div class="card"><h3 style="margin-bottom:8px"><span class="dot"></span>Online now</h3>
     <div class="sendbar" style="align-items:center;flex-wrap:wrap">
       <label style="margin:0">Show</label>
       <select id="who" style="width:auto"><option value="">Everyone</option><option value="female">Women</option><option value="male">Men</option></select>
       <button class="ghost" id="refresh" type="button">Refresh</button>
-      <label class="check" style="margin:0"><input type="checkbox" id="showme"><span>Show me as online</span></label>
+      ${isGuest ? "" : '<label class="check" style="margin:0"><input type="checkbox" id="showme"><span>Show me as online</span></label>'}
     </div>
     <p class="muted" style="margin:8px 0 0">Members from your city come first, then the nearest. Tap Message to text anyone directly.</p></div>
     <div class="grid" id="onlinelist"><p class="muted">Loading…</p></div>`);
 
   const showme = el("showme");
-  showme.checked = !presenceHidden();
-  showme.onchange = async () => {
-    try {
-      if (showme.checked) { localStorage.removeItem("desire_hide_online"); await beat(); }
-      else { localStorage.setItem("desire_hide_online", "1"); await updateDoc(doc(db, "users", user.uid), { lastSeen: deleteField() }); }
-    } catch (err) { flash(friendly(err)); }
-  };
+  if (showme) {
+    showme.checked = !presenceHidden();
+    showme.onchange = async () => {
+      try {
+        if (showme.checked) { localStorage.removeItem("desire_hide_online"); await beat(); }
+        else { localStorage.setItem("desire_hide_online", "1"); await updateDoc(doc(db, "users", user.uid), { lastSeen: deleteField() }); }
+      } catch (err) { flash(friendly(err)); }
+    };
+  }
 
   const norm = (x) => String(x || "").trim().toLowerCase();
   const ago = (ms) => { const m = Math.floor((Date.now() - ms) / 60000); return m < 5 ? "Online now" : `Active ${m} min ago`; };
   let people = [];
 
   const draw = () => {
-    const who = el("who").value, mine = norm(profile.city);
+    const who = el("who").value, mine = norm(me.city);
     const list = people.filter((p) => !who || p.gender === who).map((p) => ({
       ...p, same: norm(p.city) === mine, seen: p.lastSeen.toMillis(),
       km: hasCell(profile) && hasCell(p) ? distKm(profile, p) : null,
@@ -478,7 +494,7 @@ async function pageOnline() {
     const cutoff = Timestamp.fromMillis(Date.now() - ONLINE_MS);
     const [snap, blocks] = await Promise.all([
       getDocs(query(collection(db, "users"), where("lastSeen", ">=", cutoff), orderBy("lastSeen", "desc"), limit(150))),
-      getDocs(query(collection(db, "blocks"), where("blockerId", "==", user.uid))),
+      isGuest ? Promise.resolve({ docs: [] }) : getDocs(query(collection(db, "blocks"), where("blockerId", "==", user.uid))),
     ]);
     const blocked = new Set(blocks.docs.map((d) => d.data().blockedId));
     people = snap.docs.filter((d) => d.id !== user.uid && !blocked.has(d.id))
@@ -494,7 +510,8 @@ async function pageOnline() {
 }
 
 async function pageProfile(uid) {
-  if (!requireVerified()) return;
+  if (!requireChatter()) return;
+  const isGuest = user.isAnonymous;
   const s = await getDoc(doc(db, "users", uid));
   if (!s.exists() || s.data().banned || s.data().hidden) return render('<div class="card">Profile not found.</div>');
   const p = s.data();
@@ -504,12 +521,12 @@ async function pageProfile(uid) {
     <p><a class="btn" href="#/chat/${esc(uid)}">Message</a></p>
     <hr style="border-color:var(--line)">
     <div style="display:flex;gap:16px;flex-wrap:wrap">
-      <button class="ghost" id="block">Block</button>
+      ${isGuest ? "" : '<button class="ghost" id="block">Block</button>'}
       <form id="report" style="display:flex;gap:8px;flex:1;min-width:240px">
         <input name="reason" placeholder="Report a problem…" maxlength="500" required>
         <button class="ghost" type="submit">Report</button></form>
     </div></div>`);
-  el("block").onclick = async () => {
+  if (el("block")) el("block").onclick = async () => {
     if (!confirm("Block this member?")) return;
     await setDoc(doc(db, "blocks", `${user.uid}_${uid}`), { blockerId: user.uid, blockedId: uid, createdAt: serverTimestamp() });
     go("#/browse");
@@ -530,7 +547,7 @@ async function pageProfile(uid) {
 
 // ------------------------------------------------------------------ chat
 async function pageInbox() {
-  if (!requireVerified()) return;
+  if (!requireChatter()) return;
   render('<h2>Messages</h2><div id="list"><p class="muted">Loading…</p></div>');
   const q = query(collection(db, "conversations"), where("participants", "array-contains", user.uid), limit(100));
   const unsub = onSnapshot(q, async (snap) => {
@@ -543,27 +560,54 @@ async function pageInbox() {
     el("list").innerHTML = items.map((c) => `
       <a href="#/chat/${esc(c.other)}" style="color:inherit;text-decoration:none"><div class="card">
       <b>${esc(c.name)}</b> <span class="muted">· last message ${esc(fmt(c.updatedAt?.toMillis?.()))}</span></div></a>`).join("")
-      || '<p class="muted">No conversations yet. <a href="#/browse">Find someone to talk to.</a></p>';
+      || `<p class="muted">No conversations yet. <a href="${user.isAnonymous ? "#/online" : "#/browse"}">Find someone to talk to.</a></p>`;
   }, (err) => flash(friendly(err)));
   cleanups.push(unsub);
 }
 
 async function pageChat(uid) {
-  if (!requireVerified()) return;
+  if (!requireChatter()) return;
   if (uid === user.uid) return go("#/chat");
   const ps = await getDoc(doc(db, "users", uid));
-  if (!ps.exists() || ps.data().banned) return render('<div class="card">This member is not available.</div>');
-  const p = ps.data();
+  let p, partnerIsGuest = false;
+  if (ps.exists()) {
+    if (ps.data().banned) return render('<div class="card">This member is not available.</div>');
+    p = ps.data();
+  } else {
+    const gs = await getDoc(doc(db, "guestNames", uid)).catch(() => null);
+    if (!gs || !gs.exists()) return render('<div class="card">This member is not available.</div>');
+    p = { name: `${gs.data().nickname} (guest)` };
+    partnerIsGuest = true;
+  }
   const pair = [user.uid, uid].sort();
   const convId = pair.join("_");
 
   render(`<div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-      <h3 style="margin:0"><a href="#/profile/${esc(uid)}">${esc(p.name)}</a></h3>
+      <h3 style="margin:0">${partnerIsGuest ? esc(p.name) : `<a href="#/profile/${esc(uid)}">${esc(p.name)}</a>`}</h3>
       <span class="muted">Chats may be reviewed by moderators for safety.</span></div>
     <div class="thread" id="thread"></div>
     <form id="send" class="sendbar"><textarea name="body" required maxlength="2000" placeholder="Write a message…"></textarea>
-    <button type="submit">Send</button></form></div>`);
+    <button type="submit">Send</button></form>
+    ${partnerIsGuest || user.isAnonymous ? `<div class="btnrow">${!user.isAnonymous ? '<button class="ghost" id="gblock">Block</button>' : ""}<button class="ghost" id="greport">Report</button></div>` : ""}</div>`);
+
+  if (el("gblock")) el("gblock").onclick = async () => {
+    if (!confirm("Block this person?")) return;
+    try {
+      await setDoc(doc(db, "blocks", `${user.uid}_${uid}`), { blockerId: user.uid, blockedId: uid, createdAt: serverTimestamp() });
+      go("#/chat");
+    } catch (err) { flash(friendly(err)); }
+  };
+  if (el("greport")) el("greport").onclick = async () => {
+    const reason = (prompt("What went wrong? (sent to moderators)") || "").trim();
+    if (!reason) return;
+    try {
+      await addDoc(collection(db, "reports"), {
+        reporterId: user.uid, reportedId: uid, reason: `[Private chat ${convId}] ${reason}`.slice(0, 500), resolved: false, createdAt: serverTimestamp(),
+      });
+      flash("Thanks, moderators will review this report.", "ok");
+    } catch (err) { flash(friendly(err)); }
+  };
 
   const thread = el("thread");
   const q = query(collection(db, "conversations", convId, "messages"), orderBy("createdAt", "desc"), limit(200));
@@ -603,12 +647,27 @@ const WAIT_FRESH_MS = 60 * 1000, WAIT_PING_MS = 20 * 1000, WAIT_TRY_MS = 4000;
 const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 
 async function pageRandom() {
-  if (!requireVerified()) return;
-  if (!profile) return render('<div class="card"><p>No member profile found for this account.</p></div>');
+  if (!requireChatter()) return;
+  const self = selfRecord();
+  if (!self) return render('<div class="card"><p>No profile found for this account.</p></div>');
+  if (!self.gender) {   // guest sessions created before gender existed
+    render(`<div class="card narrow small"><h2>One quick thing</h2><p class="muted">Blind chat matches opposite genders, so tell us which you are.</p>
+      <form id="g"><select name="gender" required><option value="">Choose…</option><option value="male">Male</option><option value="female">Female</option></select>
+      <p><button type="submit">Continue</button></p></form></div>`);
+    el("g").onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        await updateDoc(doc(db, "guests", user.uid), { gender: e.target.gender.value });
+        guest.gender = e.target.gender.value;
+        route();
+      } catch (err) { flash(friendly(err)); }
+    };
+    return;
+  }
 
   const myWait = doc(db, "waiting", user.uid);
-  const wantLabel = profile.gender === "male" ? "a woman" : "a man";
-  const strangerLabel = profile.gender === "male" ? "Woman" : "Man";
+  const wantLabel = self.gender === "male" ? "a woman" : "a man";
+  const strangerLabel = self.gender === "male" ? "Woman" : "Man";
   let searching = false, matching = false, entering = false, room = null;   // room = { id, other, ended }
   let pingT = null, tryT = null, unsubWait = null, unsubRoom = null, unsubMsgs = null, blocked = new Set();
 
@@ -724,7 +783,7 @@ async function pageRandom() {
     try {
       const cutoff = Timestamp.fromMillis(Date.now() - WAIT_FRESH_MS);
       const snap = await getDocs(query(collection(db, "waiting"),
-        where("gender", "==", oppositeOf(profile.gender)), where("status", "==", "waiting"),
+        where("gender", "==", oppositeOf(self.gender)), where("status", "==", "waiting"),
         where("pingAt", ">=", cutoff), orderBy("pingAt", "asc"), limit(10)));
       const cands = shuffle(snap.docs.map((d) => d.id).filter((id) => id !== user.uid && !blocked.has(id)));
       for (const other of cands) {
@@ -755,7 +814,7 @@ async function pageRandom() {
         blocked = new Set(b.docs.map((d) => d.data().blockedId));
       } catch (_) {}
       try { await deleteDoc(myWait); } catch (_) {}      // clear any stale entry
-      await setDoc(myWait, { gender: profile.gender, status: "waiting", roomId: null, pingAt: serverTimestamp() });
+      await setDoc(myWait, { gender: self.gender, status: "waiting", roomId: null, pingAt: serverTimestamp() });
       if (!searching) return;                             // cancelled while writing
       unsubWait = onSnapshot(myWait, (snap) => {
         const d = snap.data();
@@ -780,10 +839,11 @@ async function pageGuest() {
   if (user && user.isAnonymous && guest) return go("#/lobby");
   const maxDate = new Date().toISOString().slice(0, 10);
   render(`<div class="card narrow small"><h2>Chat as a guest</h2>
-    <p class="muted">No email needed. Guests can use the public lobby only. For profiles and private messages,
+    <p class="muted">No email needed. Guests can use the lobby, online list, blind chat and messages. To browse everyone in Discover,
     <a href="#/register">create a free account</a>.</p>
     <form id="f">
       <label>Nickname</label><input name="nickname" required minlength="2" maxlength="20">
+      <label>I am</label><select name="gender" required><option value="">Choose…</option><option value="male">Male</option><option value="female">Female</option></select>
       <label>Date of birth</label><input type="date" name="dob" required max="${maxDate}">
       <label class="check"><input type="checkbox" name="adult" value="1"><span>I confirm that I am 18 years of age or older.</span></label>
       <label class="check"><input type="checkbox" name="terms" value="1"><span>I accept the <a href="#/terms" target="_blank">Terms</a>, including that messages may be reviewed by moderators.</span></label>
@@ -797,6 +857,7 @@ async function pageGuest() {
     const errors = [];
     if (nickname.length < 2 || nickname.length > 20) errors.push("Nickname must be 2-20 characters.");
     if (isNaN(dob) || ageOf(dob) < 18) errors.push("You must be at least 18 years old.");
+    if (!["male", "female"].includes(v.gender)) errors.push("Please choose your gender.");
     if (!v.adult) errors.push("You must confirm you are 18 or older.");
     if (!v.terms) errors.push("You must accept the Terms.");
     if (errors.length) return flash(errors.join(" "));
@@ -805,10 +866,13 @@ async function pageGuest() {
     try {
       const u = auth.currentUser && auth.currentUser.isAnonymous ? auth.currentUser : (await signInAnonymously(auth)).user;
       try {
-        await setDoc(doc(db, "guests", u.uid), {
-          nickname, dob: Timestamp.fromDate(dob), adultConfirmed: true,
+        const gb = writeBatch(db);
+        gb.set(doc(db, "guests", u.uid), {
+          nickname, gender: v.gender, dob: Timestamp.fromDate(dob), adultConfirmed: true,
           consentAt: serverTimestamp(), createdAt: serverTimestamp(), banned: false,
         });
+        gb.set(doc(db, "guestNames", u.uid), { nickname });
+        await gb.commit();
       } catch (err) { await u.delete(); throw err; }
       await loadSession(u);
       busy = false;
