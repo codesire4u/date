@@ -51,3 +51,11 @@ header .logo{font-family:Georgia,'Times New Roman',serif;font-style:italic;font-
 button,.btn{box-shadow:0 4px 16px rgba(255,61,113,.35)}
 button.ghost,.btn.ghost{box-shadow:none}
 @media(max-width:600px){.hero h1{font-size:2.2rem}}
+
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);margin-right:8px}
+
+.pulse{display:inline-block;width:14px;height:14px;border-radius:50%;background:var(--accent);margin-right:10px;vertical-align:middle;animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{0%{transform:scale(.8);opacity:.6;box-shadow:0 0 0 0 rgba(255,61,113,.6)}70%{transform:scale(1);opacity:1;box-shadow:0 0 0 14px rgba(255,61,113,0)}100%{transform:scale(.8);opacity:.6}}
+.msg.sys{align-self:center;background:transparent;color:var(--muted);font-size:.85rem;text-align:center}
+.msg.stranger b{color:var(--gold)}
+.btnrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}

@@ -72,3 +72,25 @@ Email stays mandatory for profiles and private (1-to-1) messages, the only excep
 - can report any lobby message; admins can delete messages and ban guests (all recorded in the audit log).
 
 Honest limitations: a guest has no email, so a banned guest can return by clearing browser data and starting a new guest session. Anonymous accounts are also easy to create in bulk. Enable **App Check** (free), watch the lobby, and if abuse grows, make the lobby members-only by removing `guestOk()` from `canLobby()` in `firestore.rules`. Lobby messages are kept until you delete them; prune old ones occasionally to stay inside the free quota.
+
+## Nearby members
+On **Discover**, members can tap "Use my location" to see people close to them and message them. Only a coarse grid cell (about 5 km wide, stored as integers `gx`/`gy` on the profile) is saved, never exact coordinates, and other members only see a range such as "Within 10 km". Members can stop sharing at any time. After updating, **republish `firestore.rules`**: the rules now allow those two optional fields.
+
+## Online members
+The **Online** page lists every member active in the last 6 minutes (a `lastSeen` timestamp refreshed every 4 minutes while the site is open), your own city first, then nearest, with a Message button for each. Members can switch "Show me as online" off. Free-plan note: each open tab writes about 15 times an hour, so keep an eye on the daily write quota (20,000) as you grow. After updating, **republish `firestore.rules`**.
+
+## Blind chat (Omegle-style random match, opposite gender only)
+**Random** in the menu pairs a verified member with an anonymous member of the **opposite gender** who is searching at the same moment. No Cloud Functions are used.
+
+How it works: pressing *Find someone* writes `waiting/{uid}` (gender copied from the profile, refreshed every 20 s). The client queries fresh waiting entries of the opposite gender, picks one at random and, in one Firestore transaction, creates `rooms/{id}` and flips both waiting entries to `matched`. Each side's listener then opens the room. *Next* ends the room and searches again; *Leave* ends it; closing the tab ends it too.
+
+What the rules enforce (not just the UI): both entries must be fresh and still waiting, the two genders must differ, the room must be brand new in the same commit, only the two participants can read or post, and nobody can post after the room has ended. Admin review of a room uses the same audit entry + 10-minute grant as private conversations (**Admin > Blind chats**). Members can report their partner; the report carries the room id.
+
+**After updating:** `firebase deploy --only firestore` (publishes the new rules **and** the new composite index for `waiting`; the index takes a minute or two to build, until then matching shows an error in the browser console with a link).
+
+Limits to know about:
+- **Anonymity is front-end deep.** The chat UI hides names, but the partner's user id is in the room document, and member profiles are readable by other members, so a technical user could look the partner up. True anonymity would need Cloud Functions (paid Blaze plan).
+- Matching only works while both people have the page open (it is a live queue). With few members online, searches will wait; consider seeding it with a "N people searching" counter later.
+- A tab that crashes can leave a stale waiting entry for up to 60 s; the partner just taps *Next*.
+- Free-plan cost: about 3 writes/min while searching plus 1 per message. Rooms and messages are kept for moderation, so prune old `rooms` occasionally.
+- Gender matching uses the gender on the member's profile (strictly male <-> female), ignoring the "looking for" setting.

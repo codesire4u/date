@@ -5,7 +5,8 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import {
   doc, getDoc, setDoc, addDoc, collection, query, where, orderBy, limit,
-  getDocs, getCountFromServer, onSnapshot, writeBatch, serverTimestamp, Timestamp,
+  getDocs, getCountFromServer, onSnapshot, writeBatch, serverTimestamp, Timestamp, updateDoc, deleteField,
+  deleteDoc, runTransaction,
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 
 // ------------------------------------------------------------------ state & helpers
@@ -25,6 +26,37 @@ const fmt = (ms) => (ms ? new Date(ms).toLocaleString() : "");
 const render = (html) => { el("app").innerHTML = html; };
 const go = (hash) => { if (location.hash === hash) route(); else location.hash = hash; };
 const verifyUrl = () => location.origin + location.pathname;
+
+
+// ---- nearby: location is stored only as a coarse ~5 km grid cell (gx, gy), never exact coordinates
+const hasCell = (o) => o && Number.isInteger(o.gx) && Number.isInteger(o.gy);
+function distKm(a, b) {
+  const R = 6371, rad = (x) => (x * Math.PI) / 180;
+  const la1 = rad(a.gx / 20), la2 = rad(b.gx / 20), dLa = la2 - la1, dLo = rad((b.gy - a.gy) / 20);
+  const h = Math.sin(dLa / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLo / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+function distLabel(km) {
+  for (const x of [5, 10, 25, 50, 100, 250]) if (km <= x) return `Within ${x} km`;
+  return "More than 250 km away";
+}
+
+// ---- presence: a member counts as "online" if their lastSeen heartbeat is under 6 minutes old
+const ONLINE_MS = 6 * 60 * 1000, BEAT_MS = 4 * 60 * 1000;
+let presenceTimer = null;
+const presenceHidden = () => { try { return localStorage.getItem("desire_hide_online") === "1"; } catch (_) { return false; } };
+async function beat() {
+  if (!user || user.isAnonymous || !user.emailVerified || !profile || presenceHidden() || document.hidden) return;
+  try { await updateDoc(doc(db, "users", user.uid), { lastSeen: serverTimestamp() }); } catch (_) {}
+}
+function startPresence() {
+  if (presenceTimer) clearInterval(presenceTimer);
+  presenceTimer = null;
+  if (!user || user.isAnonymous || !profile) return;
+  beat();
+  presenceTimer = setInterval(beat, BEAT_MS);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) beat(); });
 
 function ageOf(d) {
   const t = new Date();
@@ -118,7 +150,7 @@ function renderNav() {
   el("nav").innerHTML = user && user.isAnonymous
     ? `<a href="#/lobby">Lobby</a><a class="btn" href="#/register">Sign up</a><button class="ghost" id="logout">Leave</button>`
     : user
-    ? `<a href="#/browse">Discover</a><a href="#/lobby">Lobby</a><a href="#/chat">Messages</a>${claims.admin ? '<a href="#/admin">Admin</a>' : ""}<button class="ghost" id="logout">Log out</button>`
+    ? `<a href="#/browse">Discover</a><a href="#/random">Random</a><a href="#/online">Online</a><a href="#/lobby">Lobby</a><a href="#/chat">Messages</a>${claims.admin ? '<a href="#/admin">Admin</a>' : ""}<button class="ghost" id="logout">Log out</button>`
     : `<a href="#/login">Log in</a><a class="btn" href="#/register">Join</a>`;
   const lo = el("logout");
   if (lo) lo.onclick = async () => { await signOut(auth); go("#/"); };
@@ -130,6 +162,7 @@ async function route() {
   flash("");
   if (pendingFlash) { flash(pendingFlash, "warn"); pendingFlash = null; }
   renderNav();
+  if (user && !user.isAnonymous && profile && !presenceTimer) startPresence();
   const [, page = "", arg = ""] = (location.hash || "#/").split("/");
   try {
     switch (page) {
@@ -141,6 +174,8 @@ async function route() {
       case "guest": return await pageGuest();
       case "lobby": return await pageLobby();
       case "browse": return await pageBrowse();
+      case "online": return await pageOnline();
+      case "random": return await pageRandom();
       case "profile": return await pageProfile(arg);
       case "chat": return arg ? await pageChat(arg) : await pageInbox();
       case "admin": return await pageAdmin(arg);
@@ -155,6 +190,7 @@ async function route() {
 window.addEventListener("hashchange", route);
 onAuthStateChanged(auth, async (u) => {
   await loadSession(u);
+  startPresence();
   if (!busy) route();
 });
 
@@ -165,7 +201,8 @@ function pageHome() {
       <h1>Where <em>desire</em> meets connection.</h1>
       <p class="muted">Flirt, tease and fall for someone new. An 18+ community for adults who want chemistry, passion and a little mischief. Verified emails, blocking and reporting keep it safe.</p>
       <p style="margin-top:24px"><a class="btn" href="#/${user && !user.isAnonymous ? "browse" : "register"}">${user && !user.isAnonymous ? "Discover people" : "Find your spark"}</a>
-        <a class="btn ghost" href="#/${user ? "lobby" : "guest"}">${user ? "Open lobby" : "Chat as guest (no sign-up)"}</a></p>
+        <a class="btn ghost" href="#/${user ? "lobby" : "guest"}">${user ? "Open lobby" : "Chat as guest (no sign-up)"}</a>
+        ${user && !user.isAnonymous ? '<a class="btn ghost" href="#/random">&#127917; Blind chat</a>' : ""}</p>
     </div>
     <div class="grid">
       <div class="card"><h3>&#128149; Adults only</h3><p class="muted">Everyone confirms they are an adult and enters their date of birth at sign-up.</p></div>
@@ -182,6 +219,9 @@ function pageTerms() {
     <li><b>Message moderation:</b> private messages are not end-to-end encrypted. Authorised moderators may review a conversation to investigate reports, enforce these rules and keep members safe. Each access requires a written reason and is recorded in an audit log.</li>
     <li><b>Guest chat:</b> guests may use only the public lobby (no profiles or private messages), must confirm they are 18+, and are bound by the same rules and moderation. Lobby messages are visible to all guests and members.</li>
     <li>We store your email, profile details and messages to run the service. Your email is never shown to other members.</li>
+    <li><b>Blind chat:</b> random chat pairs you with an anonymous member of the opposite gender. Names are hidden in the chat, but these conversations are stored and may be reviewed by moderators like any other message. Harassment or pressure ends with a ban.</li>
+    <li><b>Online status:</b> other members can see that you are online, and your city, while you have the site open. Turn this off any time with \"Show me as online\" on the Online page.</li>
+    <li><b>Location (optional):</b> if you tap \"Use my location\", we save only a rough area about 5 km wide. Other members see a distance range such as \"Within 10 km\", never your exact position. You can stop sharing at any time from the Discover page.</li>
     <li>Meet in public first, tell a friend where you are going, and practise safer sex.</li></ul>
     <p class="muted">Replace this summary with a full policy reviewed by a lawyer before launch.</p></div>`);
 }
@@ -314,31 +354,143 @@ async function pageBrowse() {
   if (!profile) {
     return render('<div class="card"><p>No member profile found for this account.</p></div>');
   }
-  render(`<form id="filter" class="sendbar" style="margin-bottom:16px">
+  const geo = hasCell(profile);
+  let radius = geo ? 25 : 0;   // km; 0 = any distance
+  render(`<div class="card" id="nearbox"></div>
+    <form id="filter" class="sendbar" style="margin-bottom:16px">
     <input name="city" placeholder="Filter by city"><button type="submit">Search</button></form>
     <div class="grid" id="people"><p class="muted">Loading…</p></div>`);
+
+  el("nearbox").innerHTML = geo
+    ? `<h3 style="margin-bottom:8px">&#128205; People near you</h3>
+       <div class="sendbar" style="align-items:center;flex-wrap:wrap">
+         <label style="margin:0">Show within</label>
+         <select id="radius" style="width:auto">
+           <option value="10">10 km</option><option value="25" selected>25 km</option>
+           <option value="50">50 km</option><option value="100">100 km</option><option value="0">Any distance</option>
+         </select>
+         <button class="ghost" id="sharebtn" type="button">Update my location</button>
+         <button class="ghost" id="stopshare" type="button">Stop sharing</button>
+       </div>
+       <p class="muted" style="margin:8px 0 0">Others only see a rough distance such as "Within 10 km", never your exact location.</p>`
+    : `<h3 style="margin-bottom:6px">&#128205; Find people near you</h3>
+       <p class="muted">Share your approximate location to see members close to you and message them. We save only a rough area (about 5 km wide), and others see just a distance range, never where you are exactly. You can stop sharing any time.</p>
+       <button id="sharebtn" type="button">Use my location</button>`;
+
+  el("sharebtn").onclick = () => {
+    if (!navigator.geolocation) return flash("Your browser cannot share location. You can still filter by city.");
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      try {
+        const gx = Math.round(pos.coords.latitude * 20), gy = Math.round(pos.coords.longitude * 20);
+        await updateDoc(doc(db, "users", user.uid), { gx, gy });
+        profile.gx = gx; profile.gy = gy;
+        route();
+      } catch (err) { flash(friendly(err)); }
+    }, () => flash("Location was blocked or unavailable. Allow location for this site in your browser, or filter by city."),
+    { maximumAge: 600000, timeout: 15000 });
+  };
+  if (geo) {
+    el("stopshare").onclick = async () => {
+      try {
+        await updateDoc(doc(db, "users", user.uid), { gx: deleteField(), gy: deleteField() });
+        delete profile.gx; delete profile.gy;
+        route();
+      } catch (err) { flash(friendly(err)); }
+    };
+  }
 
   const [snap, blocks] = await Promise.all([
     getDocs(query(collection(db, "users"),
       where("gender", "==", profile.lookingFor), where("lookingFor", "==", profile.gender),
-      where("banned", "==", false), where("hidden", "==", false), limit(60))),
+      where("banned", "==", false), where("hidden", "==", false), limit(geo ? 200 : 60))),
     getDocs(query(collection(db, "blocks"), where("blockerId", "==", user.uid))),
   ]);
   const blocked = new Set(blocks.docs.map((d) => d.data().blockedId));
   const people = snap.docs.filter((d) => d.id !== user.uid && !blocked.has(d.id)).map((d) => ({ id: d.id, ...d.data() }));
 
   const draw = (cityFilter) => {
-    const list = people.filter((p) => !cityFilter || p.city.toLowerCase().includes(cityFilter.toLowerCase()));
+    let list = people.filter((p) => !cityFilter || p.city.toLowerCase().includes(cityFilter.toLowerCase()));
+    if (geo) {
+      list = list.map((p) => ({ ...p, km: hasCell(p) ? distKm(profile, p) : null }));
+      if (radius) list = list.filter((p) => p.km !== null && p.km <= radius);
+      list.sort((a, b) => (a.km ?? 1e9) - (b.km ?? 1e9));
+    }
     el("people").innerHTML = list.map((p) => `
       <div class="card"><h3>${esc(p.name)}, ${ageOf(p.dob.toDate())}</h3>
-      <p class="muted">${esc(p.city)}</p>
+      <p class="muted">${p.km != null ? "&#128205; " + distLabel(p.km) + " · " : ""}${esc(p.city)}</p>
       <p>${esc(p.bio.slice(0, 140))}${p.bio.length > 140 ? "…" : ""}</p>
       <a class="btn ghost" href="#/profile/${esc(p.id)}">View</a>
       <a class="btn" href="#/chat/${esc(p.id)}">Message</a></div>`).join("")
-      || '<p class="muted">No members match yet. Check back soon.</p>';
+      || (geo && radius
+        ? `<p class="muted">Nobody within ${radius} km has shared their location yet. Try a bigger distance, or check back soon.</p>`
+        : '<p class="muted">No members match yet. Check back soon.</p>');
   };
   draw("");
   el("filter").onsubmit = (e) => { e.preventDefault(); draw(e.target.city.value.trim()); };
+  if (geo) el("radius").onchange = (e) => { radius = Number(e.target.value); draw(el("filter").city.value.trim()); };
+}
+
+async function pageOnline() {
+  if (!requireVerified()) return;
+  if (!profile) return render('<div class="card"><p>No member profile found for this account.</p></div>');
+  render(`<div class="card"><h3 style="margin-bottom:8px"><span class="dot"></span>Online now</h3>
+    <div class="sendbar" style="align-items:center;flex-wrap:wrap">
+      <label style="margin:0">Show</label>
+      <select id="who" style="width:auto"><option value="">Everyone</option><option value="female">Women</option><option value="male">Men</option></select>
+      <button class="ghost" id="refresh" type="button">Refresh</button>
+      <label class="check" style="margin:0"><input type="checkbox" id="showme"><span>Show me as online</span></label>
+    </div>
+    <p class="muted" style="margin:8px 0 0">Members from your city come first, then the nearest. Tap Message to text anyone directly.</p></div>
+    <div class="grid" id="onlinelist"><p class="muted">Loading…</p></div>`);
+
+  const showme = el("showme");
+  showme.checked = !presenceHidden();
+  showme.onchange = async () => {
+    try {
+      if (showme.checked) { localStorage.removeItem("desire_hide_online"); await beat(); }
+      else { localStorage.setItem("desire_hide_online", "1"); await updateDoc(doc(db, "users", user.uid), { lastSeen: deleteField() }); }
+    } catch (err) { flash(friendly(err)); }
+  };
+
+  const norm = (x) => String(x || "").trim().toLowerCase();
+  const ago = (ms) => { const m = Math.floor((Date.now() - ms) / 60000); return m < 5 ? "Online now" : `Active ${m} min ago`; };
+  let people = [];
+
+  const draw = () => {
+    const who = el("who").value, mine = norm(profile.city);
+    const list = people.filter((p) => !who || p.gender === who).map((p) => ({
+      ...p, same: norm(p.city) === mine, seen: p.lastSeen.toMillis(),
+      km: hasCell(profile) && hasCell(p) ? distKm(profile, p) : null,
+    }));
+    // your city first, then nearest, then most recently active
+    list.sort((a, b) => (b.same - a.same) || ((a.km ?? 1e9) - (b.km ?? 1e9)) || (b.seen - a.seen));
+    el("onlinelist").innerHTML = list.map((p) => `
+      <div class="card"><h3><span class="dot"></span>${esc(p.name)}, ${ageOf(p.dob.toDate())}</h3>
+      <p class="muted">${p.same ? '<span class="badge ok">Your city</span> ' : ""}${p.km != null ? "&#128205; " + distLabel(p.km) + " · " : ""}${esc(p.city)}</p>
+      <p class="muted">${ago(p.seen)}</p>
+      <p>${esc(p.bio.slice(0, 120))}${p.bio.length > 120 ? "…" : ""}</p>
+      <a class="btn ghost" href="#/profile/${esc(p.id)}">View</a>
+      <a class="btn" href="#/chat/${esc(p.id)}">Message</a></div>`).join("")
+      || '<p class="muted">Nobody else is online right now. Check back soon, or browse Discover.</p>';
+  };
+
+  const load = async () => {
+    const cutoff = Timestamp.fromMillis(Date.now() - ONLINE_MS);
+    const [snap, blocks] = await Promise.all([
+      getDocs(query(collection(db, "users"), where("lastSeen", ">=", cutoff), orderBy("lastSeen", "desc"), limit(150))),
+      getDocs(query(collection(db, "blocks"), where("blockerId", "==", user.uid))),
+    ]);
+    const blocked = new Set(blocks.docs.map((d) => d.data().blockedId));
+    people = snap.docs.filter((d) => d.id !== user.uid && !blocked.has(d.id))
+      .map((d) => ({ id: d.id, ...d.data() })).filter((p) => !p.banned && !p.hidden && p.lastSeen);
+    draw();
+  };
+
+  el("who").onchange = draw;
+  el("refresh").onclick = () => load().catch((err) => flash(friendly(err)));
+  await load();
+  const t = setInterval(() => load().catch(() => {}), 60000);   // auto-refresh while this page is open
+  cleanups.push(() => clearInterval(t));
 }
 
 async function pageProfile(uid) {
@@ -347,7 +499,7 @@ async function pageProfile(uid) {
   if (!s.exists() || s.data().banned || s.data().hidden) return render('<div class="card">Profile not found.</div>');
   const p = s.data();
   render(`<div class="card"><h2>${esc(p.name)}, ${ageOf(p.dob.toDate())}</h2>
-    <p class="muted">${esc(p.city)} · ${esc(p.gender)}</p>
+    <p class="muted">${hasCell(profile) && hasCell(p) ? "&#128205; " + distLabel(distKm(profile, p)) + " · " : ""}${esc(p.city)} · ${esc(p.gender)}</p>
     <p style="white-space:pre-wrap">${esc(p.bio || "No bio yet.")}</p>
     <p><a class="btn" href="#/chat/${esc(uid)}">Message</a></p>
     <hr style="border-color:var(--line)">
@@ -440,6 +592,186 @@ async function pageChat(uid) {
       flash("Message not sent. You may be blocked, or this member is unavailable.");
     }
   };
+}
+
+
+// ------------------------------------------------------------------ random blind chat (Omegle-style)
+// Queue lives in Firestore (`waiting/{uid}`). Whoever searches claims one fresh, opposite-gender entry plus their
+// own in a single transaction and creates a room. Firestore rules enforce the opposite-gender pairing.
+const oppositeOf = (g) => (g === "male" ? "female" : "male");
+const WAIT_FRESH_MS = 60 * 1000, WAIT_PING_MS = 20 * 1000, WAIT_TRY_MS = 4000;
+const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+async function pageRandom() {
+  if (!requireVerified()) return;
+  if (!profile) return render('<div class="card"><p>No member profile found for this account.</p></div>');
+
+  const myWait = doc(db, "waiting", user.uid);
+  const wantLabel = profile.gender === "male" ? "a woman" : "a man";
+  const strangerLabel = profile.gender === "male" ? "Woman" : "Man";
+  let searching = false, matching = false, entering = false, room = null;   // room = { id, other, ended }
+  let pingT = null, tryT = null, unsubWait = null, unsubRoom = null, unsubMsgs = null, blocked = new Set();
+
+  const stopSearch = async () => {
+    searching = false;
+    clearInterval(pingT); clearInterval(tryT); pingT = tryT = null;
+    if (unsubWait) { unsubWait(); unsubWait = null; }
+    try { await deleteDoc(myWait); } catch (_) {}
+  };
+  const leaveRoom = async () => {
+    if (unsubRoom) { unsubRoom(); unsubRoom = null; }
+    if (unsubMsgs) { unsubMsgs(); unsubMsgs = null; }
+    if (room && !room.ended) {
+      room.ended = true;
+      try { await updateDoc(doc(db, "rooms", room.id), { ended: true }); } catch (_) {}
+    }
+  };
+  const teardown = () => { stopSearch(); leaveRoom(); };
+  cleanups.push(teardown);
+  const onHide = () => { if (searching || (room && !room.ended)) teardown(); };
+  window.addEventListener("pagehide", onHide);
+  cleanups.push(() => window.removeEventListener("pagehide", onHide));
+
+  // ---------- screens
+  const showIdle = (note) => render(`<div class="card narrow"><h2>&#127917; Blind chat</h2>
+    <p>Get connected to a random, anonymous <b>${wantLabel === "a woman" ? "woman" : "man"}</b> who is also looking right now. No names, no photos, just conversation.
+    If the vibe is good, keep talking. If not, tap <b>Next</b>.</p>
+    ${note ? `<div class="flash warn">${esc(note)}</div>` : ""}
+    <div class="notice">Be respectful. Never share contact details or money. Chats are stored and may be reviewed by moderators; use <b>Report</b> if someone crosses a line.</div>
+    <button id="start">Find someone</button></div>`);
+  const bindIdle = () => { el("start").onclick = startSearch; };
+
+  const showSearching = () => {
+    render(`<div class="card narrow" style="text-align:center"><h2><span class="pulse"></span>Looking for ${wantLabel}…</h2>
+      <p class="muted">Keep this page open. We'll connect you the moment someone of the opposite gender is waiting.</p>
+      <button class="ghost" id="cancel">Cancel</button></div>`);
+    el("cancel").onclick = async () => { await stopSearch(); showIdle(); bindIdle(); };
+  };
+
+  const showRoom = () => {
+    render(`<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+        <h3 style="margin:0">&#127917; Stranger <span class="badge">${strangerLabel}</span></h3>
+        <span class="muted">Anonymous. Chats may be reviewed by moderators.</span></div>
+      <div class="thread" id="thread"></div>
+      <form id="send" class="sendbar"><textarea name="body" required maxlength="1000" placeholder="Say hi…"></textarea><button type="submit">Send</button></form>
+      <div class="btnrow"><button id="next">Next &#8594;</button><button class="ghost" id="report">Report</button><button class="ghost" id="leave">Leave</button></div></div>`);
+
+    const thread = el("thread");
+    let sysNote = "";
+    const draw = (items) => {
+      thread.innerHTML = '<div class="msg sys">You are connected. Say hello!</div>'
+        + items.map((m) => m.senderId === user.uid
+          ? `<div class="msg mine">${esc(m.body)}</div>`
+          : `<div class="msg stranger"><b>Stranger:</b> ${esc(m.body)}</div>`).join("")
+        + sysNote;
+      thread.scrollTop = thread.scrollHeight;
+    };
+    let items = [];
+    unsubMsgs = onSnapshot(query(collection(db, "rooms", room.id, "messages"), orderBy("createdAt", "desc"), limit(200)), (snap) => {
+      items = snap.docs.map((d) => d.data({ serverTimestamps: "estimate" })).reverse();
+      draw(items);
+    }, () => flash("Could not load messages."));
+    unsubRoom = onSnapshot(doc(db, "rooms", room.id), (snap) => {
+      if (snap.exists() && snap.data().ended && !room.ended) {
+        room.ended = true;
+        sysNote = '<div class="msg sys">The stranger has left the chat.</div>';
+        el("send").querySelector("textarea").disabled = true;
+        el("send").querySelector("button").disabled = true;
+        draw(items);
+      }
+    });
+
+    el("send").onsubmit = async (e) => {
+      e.preventDefault();
+      const ta = e.target.body, body = ta.value.trim();
+      if (!body || room.ended) return;
+      ta.value = "";
+      try {
+        await addDoc(collection(db, "rooms", room.id, "messages"), { senderId: user.uid, body, createdAt: serverTimestamp() });
+      } catch (_) { ta.value = body; flash("Message not sent."); }
+    };
+    el("next").onclick = async () => { await leaveRoom(); room = null; startSearch(); };
+    el("leave").onclick = async () => { await leaveRoom(); room = null; showIdle(); bindIdle(); };
+    el("report").onclick = async () => {
+      const reason = (prompt("What went wrong? (sent to moderators with this chat)") || "").trim();
+      if (!reason) return;
+      try {
+        await addDoc(collection(db, "reports"), {
+          reporterId: user.uid, reportedId: room.other,
+          reason: `[Blind chat ${room.id}] ${reason}`.slice(0, 500), resolved: false, createdAt: serverTimestamp(),
+        });
+        flash("Thanks, moderators will review this chat. Tap Next to move on.", "ok");
+      } catch (err) { flash(friendly(err)); }
+    };
+  };
+
+  // ---------- matching
+  const enterRoom = async (roomId) => {
+    if (room || entering) return;
+    entering = true;
+    await stopSearch();                                   // also removes my queue entry
+    const rs = await getDoc(doc(db, "rooms", roomId));
+    if (!rs.exists()) { entering = false; return startSearch(); }
+    room = { id: roomId, other: rs.data().participants.find((u) => u !== user.uid), ended: !!rs.data().ended };
+    entering = false;
+    showRoom();
+  };
+
+  const tryMatch = async () => {
+    if (matching || !searching || room) return;
+    matching = true;
+    try {
+      const cutoff = Timestamp.fromMillis(Date.now() - WAIT_FRESH_MS);
+      const snap = await getDocs(query(collection(db, "waiting"),
+        where("gender", "==", oppositeOf(profile.gender)), where("status", "==", "waiting"),
+        where("pingAt", ">=", cutoff), orderBy("pingAt", "asc"), limit(10)));
+      const cands = shuffle(snap.docs.map((d) => d.id).filter((id) => id !== user.uid && !blocked.has(id)));
+      for (const other of cands) {
+        if (!searching) return;
+        const theirs = doc(db, "waiting", other), roomRef = doc(collection(db, "rooms"));
+        const won = await runTransaction(db, async (tx) => {
+          const mine = await tx.get(myWait);
+          if (!mine.exists() || mine.data().status !== "waiting") return false;   // someone already matched me
+          const t = await tx.get(theirs);
+          if (!t.exists() || t.data().status !== "waiting") return false;
+          tx.set(roomRef, { participants: [user.uid, other], createdAt: serverTimestamp(), ended: false });
+          tx.update(myWait, { status: "matched", roomId: roomRef.id });
+          tx.update(theirs, { status: "matched", roomId: roomRef.id });
+          return true;
+        }).catch(() => false);
+        if (won) return;                                  // my queue listener enters the room
+      }
+    } catch (err) { console.error(err); }
+    finally { matching = false; }
+  };
+
+  async function startSearch() {
+    showSearching();
+    searching = true;
+    try {
+      try {
+        const b = await getDocs(query(collection(db, "blocks"), where("blockerId", "==", user.uid)));
+        blocked = new Set(b.docs.map((d) => d.data().blockedId));
+      } catch (_) {}
+      try { await deleteDoc(myWait); } catch (_) {}      // clear any stale entry
+      await setDoc(myWait, { gender: profile.gender, status: "waiting", roomId: null, pingAt: serverTimestamp() });
+      if (!searching) return;                             // cancelled while writing
+      unsubWait = onSnapshot(myWait, (snap) => {
+        const d = snap.data();
+        if (d && d.status === "matched" && d.roomId) enterRoom(d.roomId);
+      });
+      pingT = setInterval(() => { updateDoc(myWait, { pingAt: serverTimestamp() }).catch(() => {}); }, WAIT_PING_MS);
+      tryT = setInterval(tryMatch, WAIT_TRY_MS);
+      tryMatch();
+    } catch (err) {
+      searching = false;
+      showIdle(friendly(err));
+      bindIdle();
+    }
+  }
+
+  showIdle(); bindIdle();
 }
 
 // ------------------------------------------------------------------ guest lobby (no registration)
@@ -559,7 +891,7 @@ async function pageLobby() {
 
 // ------------------------------------------------------------------ admin (Firestore rules enforce everything here)
 const adminTabs = `<p><a href="#/admin">Members</a> · <a href="#/admin/conversations">Conversations</a> ·
-  <a href="#/admin/reports">Reports</a> · <a href="#/admin/audit">Audit log</a></p>`;
+  <a href="#/admin/rooms">Blind chats</a> · <a href="#/admin/reports">Reports</a> · <a href="#/admin/audit">Audit log</a></p>`;
 
 const auditEntry = (action, target, reason) => ({
   adminUid: user.uid, adminEmail: user.email, action, target, reason, createdAt: serverTimestamp(),
@@ -609,6 +941,51 @@ async function pageAdmin(sub) {
     ]);
     const names = { [a]: nameA, [b]: nameB };
     return render(`<p><a href="#/admin/conversations">&larr; All conversations</a></p>
+      <div class="card"><h3>${esc(nameA)} (${esc(emailA.data()?.email || "")}) &amp; ${esc(nameB)} (${esc(emailB.data()?.email || "")})</h3>
+      <div class="thread">${msgs.docs.map((d) => { const m = d.data(); return `<div class="msg ${m.senderId === a ? "mine" : ""}">
+        <b>${esc(names[m.senderId] || "?")}:</b> ${esc(m.body)}<small>${esc(fmt(m.createdAt?.toMillis?.()))}</small></div>`; }).join("")
+        || '<p class="muted">No messages.</p>'}</div></div>`);
+  }
+
+  if (sub === "rooms") {
+    const snap = await getDocs(query(collection(db, "rooms"), orderBy("createdAt", "desc"), limit(200)));
+    const rows = [];
+    for (const d of snap.docs) {
+      const names = await Promise.all(d.data().participants.map(nameOf));
+      rows.push({ id: d.id, names, at: d.data().createdAt?.toMillis?.() });
+    }
+    return render(`<h2>Blind chats</h2>${adminTabs}
+      <p class="muted">Opening a chat requires a written reason and is recorded in the audit log. Reports on blind chats include the room id.</p>
+      <div class="card" style="overflow-x:auto"><table><tr><th>Between</th><th>Started</th><th>Room</th><th></th></tr>
+      ${rows.map((c) => `<tr><td>${esc(c.names.join(" & "))}</td><td>${esc(fmt(c.at))}</td><td class="muted">${esc(c.id)}</td>
+        <td><a href="#/admin/room/${esc(c.id)}">Open</a></td></tr>`).join("") || '<tr><td colspan="4" class="muted">No blind chats yet.</td></tr>'}
+      </table></div>`);
+  }
+
+  if (sub === "room") {
+    const roomId = location.hash.split("/")[3] || "";
+    if (!roomId) return go("#/admin/rooms");
+    const reason = prompt("Reason for viewing this blind chat (recorded in the audit log):");
+    if (!reason || reason.trim().length < 5) {
+      flash("A reason of at least 5 characters is required to open a chat.");
+      return go("#/admin/rooms");
+    }
+    const auditRef = doc(collection(db, "auditLog"));
+    const batch = writeBatch(db);
+    batch.set(auditRef, auditEntry("view_conversation", roomId, reason.trim().slice(0, 300)));
+    batch.set(doc(db, "accessGrants", `${user.uid}_${roomId}`), {
+      adminUid: user.uid, convId: roomId, auditId: auditRef.id, viewedAt: serverTimestamp(),
+    });
+    await batch.commit();
+    const [rs, msgs] = await Promise.all([
+      getDoc(doc(db, "rooms", roomId)),
+      getDocs(query(collection(db, "rooms", roomId, "messages"), orderBy("createdAt"), limit(1000))),
+    ]);
+    if (!rs.exists()) return go("#/admin/rooms");
+    const [a, b] = rs.data().participants;
+    const [nameA, nameB, emailA, emailB] = await Promise.all([nameOf(a), nameOf(b), getDoc(doc(db, "userPrivate", a)), getDoc(doc(db, "userPrivate", b))]);
+    const names = { [a]: nameA, [b]: nameB };
+    return render(`<p><a href="#/admin/rooms">&larr; All blind chats</a></p>
       <div class="card"><h3>${esc(nameA)} (${esc(emailA.data()?.email || "")}) &amp; ${esc(nameB)} (${esc(emailB.data()?.email || "")})</h3>
       <div class="thread">${msgs.docs.map((d) => { const m = d.data(); return `<div class="msg ${m.senderId === a ? "mine" : ""}">
         <b>${esc(names[m.senderId] || "?")}:</b> ${esc(m.body)}<small>${esc(fmt(m.createdAt?.toMillis?.()))}</small></div>`; }).join("")
