@@ -1,0 +1,53 @@
+:root{--bg:#1a0a14;--card:#2a1220;--line:#4a2238;--text:#fbeef3;--muted:#c9a0b4;--accent:#ff3d71;--accent2:#c2185b;--gold:#f4c27a;--ok:#2ecc8f;--warn:#f5b942;--err:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:radial-gradient(ellipse at top,#3a1230 0%,var(--bg) 55%) fixed;color:var(--text);line-height:1.5}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:5}
+header .logo{font-weight:800;font-size:1.3rem;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+nav{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+main{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
+h1,h2,h3{margin-top:0}
+label{display:block;margin:12px 0 4px;font-size:.9rem;color:var(--muted)}
+input,select,textarea{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:#1f0d19;color:var(--text);font:inherit}
+textarea{min-height:90px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:600px){.row{grid-template-columns:1fr}}
+.check{display:flex;gap:10px;align-items:flex-start;margin:12px 0;color:var(--text)}
+.check input{width:auto;margin-top:5px}
+button,.btn{display:inline-block;padding:10px 18px;border:0;border-radius:10px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;font-weight:600;cursor:pointer;font:inherit;font-weight:600}
+button.ghost,.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text)}
+button.danger{background:var(--err)}
+button.link{background:none;padding:0;color:var(--accent);font-weight:400}
+.flash{padding:10px 14px;border-radius:10px;margin-bottom:12px;border:1px solid}
+.flash.ok{border-color:var(--ok);color:var(--ok)}.flash.warn{border-color:var(--warn);color:var(--warn)}.flash.error{border-color:var(--err);color:var(--err)}
+.muted{color:var(--muted);font-size:.9rem}
+.hero{text-align:center;padding:48px 0}
+.hero h1{font-size:2.6rem;margin-bottom:8px}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:.78rem;border:1px solid var(--line);color:var(--muted)}
+.badge.ok{color:var(--ok);border-color:var(--ok)}.badge.err{color:var(--err);border-color:var(--err)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);font-size:.92rem;vertical-align:top}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.stat b{font-size:1.6rem;display:block}
+.thread{display:flex;flex-direction:column;gap:8px;max-height:60vh;overflow-y:auto;padding:4px}
+.msg{max-width:75%;padding:8px 12px;border-radius:14px;background:#3a1a2c;white-space:pre-wrap;word-wrap:break-word}
+.msg.mine{align-self:flex-end;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.msg small{display:block;opacity:.7;font-size:.72rem;margin-top:2px}
+.sendbar{display:flex;gap:8px;margin-top:12px}
+.sendbar textarea{min-height:44px;height:44px}
+.notice{border-left:4px solid var(--warn);padding:10px 14px;background:#33200f;border-radius:8px;margin:12px 0}
+.narrow{max-width:640px;margin:auto}
+.narrow.small{max-width:420px}
+.thread:empty{display:none}
+
+header .logo{font-family:Georgia,'Times New Roman',serif;font-style:italic;font-size:1.7rem;letter-spacing:.5px}
+.heart{-webkit-text-fill-color:var(--accent);font-size:.9rem;font-style:normal;vertical-align:middle}
+.hero h1{font-family:Georgia,'Times New Roman',serif;font-weight:400;font-size:3rem;line-height:1.15}
+.hero h1 em{font-style:italic;background:linear-gradient(90deg,var(--accent),var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent}
+.card{box-shadow:0 8px 30px rgba(255,61,113,.08)}
+button,.btn{box-shadow:0 4px 16px rgba(255,61,113,.35)}
+button.ghost,.btn.ghost{box-shadow:none}
+@media(max-width:600px){.hero h1{font-size:2.2rem}}

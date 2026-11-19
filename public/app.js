@@ -1,0 +1,706 @@
+import { auth, db } from "./firebase.js";
+import {
+  createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut,
+  onAuthStateChanged, sendEmailVerification, signInAnonymously,
+} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+import {
+  doc, getDoc, setDoc, addDoc, collection, query, where, orderBy, limit,
+  getDocs, getCountFromServer, onSnapshot, writeBatch, serverTimestamp, Timestamp,
+} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+
+// ------------------------------------------------------------------ state & helpers
+let user = null;      // Firebase Auth user
+let profile = null;   // own Firestore profile
+let claims = {};      // custom claims (admin)
+let guest = null;     // guest record when signed in anonymously
+let cleanups = [];    // listeners to detach on route change
+let busy = false;     // true while registering, to avoid re-rendering mid-flow
+let pendingFlash = null;
+const nameCache = {};
+
+const el = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = (ms) => (ms ? new Date(ms).toLocaleString() : "");
+const render = (html) => { el("app").innerHTML = html; };
+const go = (hash) => { if (location.hash === hash) route(); else location.hash = hash; };
+const verifyUrl = () => location.origin + location.pathname;
+
+function ageOf(d) {
+  const t = new Date();
+  let a = t.getUTCFullYear() - d.getUTCFullYear();
+  const m = t.getUTCMonth() - d.getUTCMonth();
+  if (m < 0 || (m === 0 && t.getUTCDate() < d.getUTCDate())) a--;
+  return a;
+}
+
+function flash(msg, type = "error") {
+  el("flash").innerHTML = msg ? `<div class="flash ${type}">${esc(msg)}</div>` : "";
+  if (msg) window.scrollTo(0, 0);
+}
+
+function friendly(err) {
+  const c = err && err.code ? err.code : "";
+  const map = {
+    "auth/email-already-in-use": "That email is already registered.",
+    "auth/invalid-email": "Please enter a valid email address.",
+    "auth/weak-password": "Password must be at least 8 characters.",
+    "auth/invalid-credential": "Incorrect email or password.",
+    "auth/wrong-password": "Incorrect email or password.",
+    "auth/user-not-found": "Incorrect email or password.",
+    "auth/user-disabled": "This account has been suspended.",
+    "auth/too-many-requests": "Too many attempts. Please wait a few minutes and try again.",
+    "permission-denied": "Not allowed. Check that you are 18+, your account is in good standing and all fields are valid.",
+  };
+  return map[c] || (err && err.message) || "Something went wrong.";
+}
+
+function cleanup() { cleanups.forEach((f) => { try { f(); } catch (_) {} }); cleanups = []; }
+
+async function nameOf(uid) {
+  if (!(uid in nameCache)) {
+    try {
+      const s = await getDoc(doc(db, "users", uid));
+      if (s.exists()) nameCache[uid] = s.data().name;
+      else {
+        const g = await getDoc(doc(db, "guests", uid));
+        nameCache[uid] = g.exists() ? `${g.data().nickname} (guest)` : "(deleted)";
+      }
+    } catch (_) { nameCache[uid] = "(unavailable)"; }
+  }
+  return nameCache[uid];
+}
+
+async function loadSession(u) {
+  user = u; profile = null; guest = null; claims = {};
+  if (!u) return;
+  if (u.isAnonymous) {
+    try {
+      const g = await getDoc(doc(db, "guests", u.uid));
+      guest = g.exists() ? { id: g.id, ...g.data() } : null;
+    } catch (_) {}
+    if (guest && guest.banned) {
+      pendingFlash = "This guest session has been suspended.";
+      user = null; guest = null;
+      await signOut(auth);
+    }
+    return;
+  }
+  try { claims = (await u.getIdTokenResult()).claims; } catch (_) {}
+  try {
+    const s = await getDoc(doc(db, "users", u.uid));
+    profile = s.exists() ? { id: s.id, ...s.data() } : null;
+  } catch (_) {}
+  if (profile && profile.banned) {      // suspended members are signed straight out
+    pendingFlash = "This account has been suspended.";
+    user = null; profile = null; claims = {};
+    await signOut(auth);
+  }
+}
+
+function requireLogin() {
+  if (!user) { go("#/login"); return false; }
+  return true;
+}
+function requireVerified() {
+  if (!requireLogin()) return false;
+  if (user.isAnonymous) {
+    render(`<div class="card narrow"><h2>Members only</h2>
+      <p>Guests can use the public lobby. Create a free account to browse profiles and send private messages.</p>
+      <p><a class="btn" href="#/register">Sign up</a> <a class="btn ghost" href="#/lobby">Back to lobby</a></p></div>`);
+    return false;
+  }
+  if (!user.emailVerified) { go("#/verify"); return false; }
+  return true;
+}
+
+function renderNav() {
+  el("nav").innerHTML = user && user.isAnonymous
+    ? `<a href="#/lobby">Lobby</a><a class="btn" href="#/register">Sign up</a><button class="ghost" id="logout">Leave</button>`
+    : user
+    ? `<a href="#/browse">Discover</a><a href="#/lobby">Lobby</a><a href="#/chat">Messages</a>${claims.admin ? '<a href="#/admin">Admin</a>' : ""}<button class="ghost" id="logout">Log out</button>`
+    : `<a href="#/login">Log in</a><a class="btn" href="#/register">Join</a>`;
+  const lo = el("logout");
+  if (lo) lo.onclick = async () => { await signOut(auth); go("#/"); };
+}
+
+// ------------------------------------------------------------------ router
+async function route() {
+  cleanup();
+  flash("");
+  if (pendingFlash) { flash(pendingFlash, "warn"); pendingFlash = null; }
+  renderNav();
+  const [, page = "", arg = ""] = (location.hash || "#/").split("/");
+  try {
+    switch (page) {
+      case "": return pageHome();
+      case "terms": return pageTerms();
+      case "register": return pageRegister();
+      case "login": return pageLogin();
+      case "verify": return pageVerify();
+      case "guest": return await pageGuest();
+      case "lobby": return await pageLobby();
+      case "browse": return await pageBrowse();
+      case "profile": return await pageProfile(arg);
+      case "chat": return arg ? await pageChat(arg) : await pageInbox();
+      case "admin": return await pageAdmin(arg);
+      default: return render('<div class="card"><h2>Page not found</h2></div>');
+    }
+  } catch (err) {
+    console.error(err);
+    flash(friendly(err));
+  }
+}
+
+window.addEventListener("hashchange", route);
+onAuthStateChanged(auth, async (u) => {
+  await loadSession(u);
+  if (!busy) route();
+});
+
+// ------------------------------------------------------------------ public pages
+function pageHome() {
+  render(`
+    <div class="hero">
+      <h1>Where <em>desire</em> meets connection.</h1>
+      <p class="muted">Flirt, tease and fall for someone new. An 18+ community for adults who want chemistry, passion and a little mischief. Verified emails, blocking and reporting keep it safe.</p>
+      <p style="margin-top:24px"><a class="btn" href="#/${user && !user.isAnonymous ? "browse" : "register"}">${user && !user.isAnonymous ? "Discover people" : "Find your spark"}</a>
+        <a class="btn ghost" href="#/${user ? "lobby" : "guest"}">${user ? "Open lobby" : "Chat as guest (no sign-up)"}</a></p>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>&#128149; Adults only</h3><p class="muted">Everyone confirms they are an adult and enters their date of birth at sign-up.</p></div>
+      <div class="card"><h3>&#128140; Real people</h3><p class="muted">Chat unlocks only after you confirm your email address.</p></div>
+      <div class="card"><h3>&#127801; You set the pace</h3><p class="muted">Block or report anyone at any time. Moderators act on reports.</p></div>
+    </div>`);
+}
+
+function pageTerms() {
+  render(`<div class="card"><h2>Terms &amp; Privacy (summary)</h2><ul>
+    <li>You must be 18 or older. Accounts found to belong to minors are removed.</li>
+    <li>Everything must be consensual. Harassment, pressure, threats, or sharing someone's content without permission lead to a ban.</li>
+    <li>No payment solicitation, scams, escorting or commercial sex offers, and no illegal content.</li>
+    <li><b>Message moderation:</b> private messages are not end-to-end encrypted. Authorised moderators may review a conversation to investigate reports, enforce these rules and keep members safe. Each access requires a written reason and is recorded in an audit log.</li>
+    <li><b>Guest chat:</b> guests may use only the public lobby (no profiles or private messages), must confirm they are 18+, and are bound by the same rules and moderation. Lobby messages are visible to all guests and members.</li>
+    <li>We store your email, profile details and messages to run the service. Your email is never shown to other members.</li>
+    <li>Meet in public first, tell a friend where you are going, and practise safer sex.</li></ul>
+    <p class="muted">Replace this summary with a full policy reviewed by a lawyer before launch.</p></div>`);
+}
+
+// ------------------------------------------------------------------ auth pages
+function pageRegister() {
+  if (user && !user.isAnonymous) return go("#/browse");
+  const maxDate = new Date().toISOString().slice(0, 10);
+  render(`
+  <div class="card narrow"><h2>Find your spark</h2>
+  <form id="f" autocomplete="on">
+    <div class="row">
+      <div><label>Name / nickname</label><input name="name" required maxlength="40"></div>
+      <div><label>Date of birth</label><input type="date" name="dob" required max="${maxDate}"></div>
+    </div>
+    <label>Email (required, used to unlock chat)</label>
+    <input type="email" name="email" required maxlength="254">
+    <div class="row">
+      <div><label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8"></div>
+      <div><label>Confirm password</label><input type="password" name="password2" required minlength="8"></div>
+    </div>
+    <div class="row">
+      <div><label>I am</label><select name="gender" required><option value="">Choose…</option><option value="male">Male</option><option value="female">Female</option></select></div>
+      <div><label>Looking for</label><select name="lookingFor" required><option value="">Choose…</option><option value="male">Men</option><option value="female">Women</option></select></div>
+    </div>
+    <label>City</label><input name="city" required maxlength="60">
+    <label>About you (optional, max 500 characters)</label><textarea name="bio" maxlength="500"></textarea>
+    <label class="check"><input type="checkbox" name="adult" value="1"><span>I confirm that I am 18 years of age or older.</span></label>
+    <label class="check"><input type="checkbox" name="terms" value="1"><span>I accept the <a href="#/terms" target="_blank">Terms</a>, including that messages may be reviewed by moderators for safety and to handle reports.</span></label>
+    <button type="submit" id="submit">Create account</button>
+    <p class="muted">Already a member? <a href="#/login">Log in</a></p>
+  </form></div>`);
+
+  el("f").onsubmit = async (e) => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(e.target).entries());
+    const errors = [];
+    v.name = (v.name || "").trim(); v.city = (v.city || "").trim(); v.bio = (v.bio || "").trim();
+    v.email = (v.email || "").trim();
+    const dob = new Date(`${v.dob}T00:00:00Z`);
+    if (v.name.length < 2 || v.name.length > 40) errors.push("Name must be 2-40 characters.");
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v.email)) errors.push("A valid email address is required.");
+    if ((v.password || "").length < 8) errors.push("Password must be at least 8 characters.");
+    if (v.password !== v.password2) errors.push("Passwords do not match.");
+    if (isNaN(dob) || ageOf(dob) < 18) errors.push("You must be at least 18 years old.");
+    if (!["male", "female"].includes(v.gender) || !["male", "female"].includes(v.lookingFor)) errors.push("Please choose your gender and who you are looking for.");
+    if (v.city.length < 2) errors.push("Please enter your city.");
+    if (!v.adult) errors.push("You must confirm you are 18 or older.");
+    if (!v.terms) errors.push("You must accept the Terms, including safety moderation of messages.");
+    if (errors.length) return flash(errors.join(" "));
+
+    const btn = el("submit"); btn.disabled = true; busy = true;
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, v.email, v.password);
+      try {
+        const batch = writeBatch(db);
+        batch.set(doc(db, "users", cred.user.uid), {
+          name: v.name, dob: Timestamp.fromDate(dob), gender: v.gender, lookingFor: v.lookingFor,
+          city: v.city, bio: v.bio, adultConfirmed: true,
+          consentAt: serverTimestamp(), createdAt: serverTimestamp(), banned: false, hidden: false,
+        });
+        batch.set(doc(db, "userPrivate", cred.user.uid), { email: cred.user.email });
+        await batch.commit();
+      } catch (err) {
+        await cred.user.delete();   // don't leave an account without a valid profile
+        throw err;
+      }
+      try { await sendEmailVerification(cred.user, { url: verifyUrl() }); } catch (_) {}
+      await loadSession(cred.user);
+      busy = false;
+      go("#/verify");
+    } catch (err) {
+      busy = false; btn.disabled = false;
+      flash(friendly(err));
+    }
+  };
+}
+
+function pageLogin() {
+  if (user && !user.isAnonymous) return go("#/browse");
+  render(`<div class="card narrow small"><h2>Log in</h2><form id="f">
+    <label>Email</label><input type="email" name="email" required>
+    <label>Password</label><input type="password" name="password" required>
+    <p><button type="submit">Log in</button></p>
+    <p class="muted">New here? <a href="#/register">Create an account</a></p></form></div>`);
+  el("f").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      const cred = await signInWithEmailAndPassword(auth, f.email.value.trim(), f.password.value);
+      await loadSession(cred.user);
+      if (user) go(user.emailVerified ? "#/browse" : "#/verify");   // user is null if suspended
+    } catch (err) { flash(friendly(err)); }
+  };
+}
+
+async function checkVerified(silent) {
+  await user.reload();
+  if (user.emailVerified) {
+    await user.getIdToken(true);       // refresh token so rules see email_verified = true
+    await loadSession(user);
+    go("#/browse");
+  } else if (!silent) {
+    flash("Not verified yet. Click the link in the email we sent, then try again.", "warn");
+  }
+}
+
+function pageVerify() {
+  if (!requireLogin()) return;
+  if (user.isAnonymous) return go("#/lobby");
+  if (user.emailVerified) return go("#/browse");
+  render(`<div class="card narrow"><h2>Check your email</h2>
+    <p>We sent a confirmation link to <b>${esc(user.email)}</b>. Chat unlocks as soon as you click it.
+    Check your spam folder if you don't see it.</p>
+    <p><button id="check">I've verified, continue</button>
+    <button class="ghost" id="resend">Resend email</button></p></div>`);
+  el("check").onclick = () => checkVerified(false).catch((e) => flash(friendly(e)));
+  el("resend").onclick = async () => {
+    try { await sendEmailVerification(user, { url: verifyUrl() }); flash("Verification email sent.", "ok"); }
+    catch (e) { flash(friendly(e)); }
+  };
+  const onVis = () => { if (document.visibilityState === "visible") checkVerified(true).catch(() => {}); };
+  document.addEventListener("visibilitychange", onVis);
+  cleanups.push(() => document.removeEventListener("visibilitychange", onVis));
+}
+
+// ------------------------------------------------------------------ discover & profiles
+async function pageBrowse() {
+  if (!requireVerified()) return;
+  if (!profile) {
+    return render('<div class="card"><p>No member profile found for this account.</p></div>');
+  }
+  render(`<form id="filter" class="sendbar" style="margin-bottom:16px">
+    <input name="city" placeholder="Filter by city"><button type="submit">Search</button></form>
+    <div class="grid" id="people"><p class="muted">Loading…</p></div>`);
+
+  const [snap, blocks] = await Promise.all([
+    getDocs(query(collection(db, "users"),
+      where("gender", "==", profile.lookingFor), where("lookingFor", "==", profile.gender),
+      where("banned", "==", false), where("hidden", "==", false), limit(60))),
+    getDocs(query(collection(db, "blocks"), where("blockerId", "==", user.uid))),
+  ]);
+  const blocked = new Set(blocks.docs.map((d) => d.data().blockedId));
+  const people = snap.docs.filter((d) => d.id !== user.uid && !blocked.has(d.id)).map((d) => ({ id: d.id, ...d.data() }));
+
+  const draw = (cityFilter) => {
+    const list = people.filter((p) => !cityFilter || p.city.toLowerCase().includes(cityFilter.toLowerCase()));
+    el("people").innerHTML = list.map((p) => `
+      <div class="card"><h3>${esc(p.name)}, ${ageOf(p.dob.toDate())}</h3>
+      <p class="muted">${esc(p.city)}</p>
+      <p>${esc(p.bio.slice(0, 140))}${p.bio.length > 140 ? "…" : ""}</p>
+      <a class="btn ghost" href="#/profile/${esc(p.id)}">View</a>
+      <a class="btn" href="#/chat/${esc(p.id)}">Message</a></div>`).join("")
+      || '<p class="muted">No members match yet. Check back soon.</p>';
+  };
+  draw("");
+  el("filter").onsubmit = (e) => { e.preventDefault(); draw(e.target.city.value.trim()); };
+}
+
+async function pageProfile(uid) {
+  if (!requireVerified()) return;
+  const s = await getDoc(doc(db, "users", uid));
+  if (!s.exists() || s.data().banned || s.data().hidden) return render('<div class="card">Profile not found.</div>');
+  const p = s.data();
+  render(`<div class="card"><h2>${esc(p.name)}, ${ageOf(p.dob.toDate())}</h2>
+    <p class="muted">${esc(p.city)} · ${esc(p.gender)}</p>
+    <p style="white-space:pre-wrap">${esc(p.bio || "No bio yet.")}</p>
+    <p><a class="btn" href="#/chat/${esc(uid)}">Message</a></p>
+    <hr style="border-color:var(--line)">
+    <div style="display:flex;gap:16px;flex-wrap:wrap">
+      <button class="ghost" id="block">Block</button>
+      <form id="report" style="display:flex;gap:8px;flex:1;min-width:240px">
+        <input name="reason" placeholder="Report a problem…" maxlength="500" required>
+        <button class="ghost" type="submit">Report</button></form>
+    </div></div>`);
+  el("block").onclick = async () => {
+    if (!confirm("Block this member?")) return;
+    await setDoc(doc(db, "blocks", `${user.uid}_${uid}`), { blockerId: user.uid, blockedId: uid, createdAt: serverTimestamp() });
+    go("#/browse");
+  };
+  el("report").onsubmit = async (e) => {
+    e.preventDefault();
+    const reason = e.target.reason.value.trim();
+    if (!reason) return;
+    try {
+      await addDoc(collection(db, "reports"), {
+        reporterId: user.uid, reportedId: uid, reason, resolved: false, createdAt: serverTimestamp(),
+      });
+      e.target.reset();
+      flash("Thanks, our moderators will review this report.", "ok");
+    } catch (err) { flash(friendly(err)); }
+  };
+}
+
+// ------------------------------------------------------------------ chat
+async function pageInbox() {
+  if (!requireVerified()) return;
+  render('<h2>Messages</h2><div id="list"><p class="muted">Loading…</p></div>');
+  const q = query(collection(db, "conversations"), where("participants", "array-contains", user.uid), limit(100));
+  const unsub = onSnapshot(q, async (snap) => {
+    const items = snap.docs.map((d) => ({ id: d.id, ...d.data({ serverTimestamps: "estimate" }) }))
+      .sort((a, b) => (b.updatedAt?.toMillis?.() || 0) - (a.updatedAt?.toMillis?.() || 0));
+    for (const c of items) {
+      c.other = c.participants.find((p) => p !== user.uid);
+      c.name = await nameOf(c.other);
+    }
+    el("list").innerHTML = items.map((c) => `
+      <a href="#/chat/${esc(c.other)}" style="color:inherit;text-decoration:none"><div class="card">
+      <b>${esc(c.name)}</b> <span class="muted">· last message ${esc(fmt(c.updatedAt?.toMillis?.()))}</span></div></a>`).join("")
+      || '<p class="muted">No conversations yet. <a href="#/browse">Find someone to talk to.</a></p>';
+  }, (err) => flash(friendly(err)));
+  cleanups.push(unsub);
+}
+
+async function pageChat(uid) {
+  if (!requireVerified()) return;
+  if (uid === user.uid) return go("#/chat");
+  const ps = await getDoc(doc(db, "users", uid));
+  if (!ps.exists() || ps.data().banned) return render('<div class="card">This member is not available.</div>');
+  const p = ps.data();
+  const pair = [user.uid, uid].sort();
+  const convId = pair.join("_");
+
+  render(`<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0"><a href="#/profile/${esc(uid)}">${esc(p.name)}</a></h3>
+      <span class="muted">Chats may be reviewed by moderators for safety.</span></div>
+    <div class="thread" id="thread"></div>
+    <form id="send" class="sendbar"><textarea name="body" required maxlength="2000" placeholder="Write a message…"></textarea>
+    <button type="submit">Send</button></form></div>`);
+
+  const thread = el("thread");
+  const q = query(collection(db, "conversations", convId, "messages"), orderBy("createdAt", "desc"), limit(200));
+  const unsub = onSnapshot(q, (snap) => {
+    const items = snap.docs.map((d) => d.data({ serverTimestamps: "estimate" })).reverse();
+    thread.innerHTML = items.map((m) => `<div class="msg ${m.senderId === user.uid ? "mine" : ""}">${esc(m.body)}<small>${esc(m.createdAt ? m.createdAt.toDate().toLocaleString() : "")}</small></div>`).join("");
+    thread.scrollTop = thread.scrollHeight;
+  }, () => flash("Could not load messages."));
+  cleanups.push(unsub);
+
+  el("send").onsubmit = async (e) => {
+    e.preventDefault();
+    const ta = e.target.body;
+    const body = ta.value.trim();
+    if (!body) return;
+    ta.value = "";
+    try {
+      const batch = writeBatch(db);
+      batch.set(doc(db, "conversations", convId), { participants: pair, updatedAt: serverTimestamp() });
+      batch.set(doc(collection(db, "conversations", convId, "messages")), {
+        senderId: user.uid, body, createdAt: serverTimestamp(),
+      });
+      await batch.commit();
+    } catch (err) {
+      ta.value = body;
+      flash("Message not sent. You may be blocked, or this member is unavailable.");
+    }
+  };
+}
+
+// ------------------------------------------------------------------ guest lobby (no registration)
+async function pageGuest() {
+  if (user && !user.isAnonymous) return go("#/lobby");
+  if (user && user.isAnonymous && guest) return go("#/lobby");
+  const maxDate = new Date().toISOString().slice(0, 10);
+  render(`<div class="card narrow small"><h2>Chat as a guest</h2>
+    <p class="muted">No email needed. Guests can use the public lobby only. For profiles and private messages,
+    <a href="#/register">create a free account</a>.</p>
+    <form id="f">
+      <label>Nickname</label><input name="nickname" required minlength="2" maxlength="20">
+      <label>Date of birth</label><input type="date" name="dob" required max="${maxDate}">
+      <label class="check"><input type="checkbox" name="adult" value="1"><span>I confirm that I am 18 years of age or older.</span></label>
+      <label class="check"><input type="checkbox" name="terms" value="1"><span>I accept the <a href="#/terms" target="_blank">Terms</a>, including that messages may be reviewed by moderators.</span></label>
+      <button type="submit" id="submit">Enter lobby</button>
+    </form></div>`);
+  el("f").onsubmit = async (e) => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(e.target).entries());
+    const nickname = (v.nickname || "").trim();
+    const dob = new Date(`${v.dob}T00:00:00Z`);
+    const errors = [];
+    if (nickname.length < 2 || nickname.length > 20) errors.push("Nickname must be 2-20 characters.");
+    if (isNaN(dob) || ageOf(dob) < 18) errors.push("You must be at least 18 years old.");
+    if (!v.adult) errors.push("You must confirm you are 18 or older.");
+    if (!v.terms) errors.push("You must accept the Terms.");
+    if (errors.length) return flash(errors.join(" "));
+
+    const btn = el("submit"); btn.disabled = true; busy = true;
+    try {
+      const u = auth.currentUser && auth.currentUser.isAnonymous ? auth.currentUser : (await signInAnonymously(auth)).user;
+      try {
+        await setDoc(doc(db, "guests", u.uid), {
+          nickname, dob: Timestamp.fromDate(dob), adultConfirmed: true,
+          consentAt: serverTimestamp(), createdAt: serverTimestamp(), banned: false,
+        });
+      } catch (err) { await u.delete(); throw err; }
+      await loadSession(u);
+      busy = false;
+      go("#/lobby");
+    } catch (err) {
+      busy = false; btn.disabled = false;
+      flash(friendly(err));
+    }
+  };
+}
+
+async function pageLobby() {
+  if (!user) return go("#/guest");
+  if (user.isAnonymous && !guest) return go("#/guest");
+  if (!user.isAnonymous && !user.emailVerified) return go("#/verify");
+  const canPost = user.isAnonymous ? !!guest : !!profile;
+  render(`<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+      <h3 style="margin:0">Public lobby</h3>
+      <span class="muted">Open to guests and members. Moderated; messages may be reviewed. Never share personal contact details.</span></div>
+    <div class="thread" id="thread"></div>
+    ${canPost ? `<form id="send" class="sendbar"><textarea name="body" required maxlength="500" placeholder="Write a message…"></textarea>
+      <button type="submit">Send</button></form>` : '<p class="muted">Read-only.</p>'}</div>`);
+
+  const thread = el("thread");
+  let current = [];
+  const q = query(collection(db, "lobby"), orderBy("createdAt", "desc"), limit(100));
+  const unsub = onSnapshot(q, (snap) => {
+    current = snap.docs.map((d) => ({ id: d.id, ...d.data({ serverTimestamps: "estimate" }) })).reverse();
+    thread.innerHTML = current.map((m) => `<div class="msg ${m.senderId === user.uid ? "mine" : ""}">
+      <b>${esc(m.name)}:</b> ${esc(m.body)}<small>${esc(fmt(m.createdAt?.toMillis?.()))}
+      ${m.senderId !== user.uid ? ` · <button class="link" data-report="${esc(m.id)}">report</button>` : ""}
+      ${claims.admin ? ` · <button class="link" data-del="${esc(m.id)}">delete</button>` : ""}</small></div>`).join("")
+      || '<p class="muted">No messages yet. Say hello.</p>';
+    thread.scrollTop = thread.scrollHeight;
+  }, () => flash("Could not load the lobby."));
+  cleanups.push(unsub);
+
+  thread.onclick = async (e) => {
+    const t = e.target;
+    try {
+      if (t.dataset.report) {
+        const m = current.find((x) => x.id === t.dataset.report);
+        if (!m || !confirm("Report this message to moderators?")) return;
+        await addDoc(collection(db, "reports"), {
+          reporterId: user.uid, reportedId: m.senderId,
+          reason: `Lobby message by ${m.name}: ${m.body}`.slice(0, 500), resolved: false, createdAt: serverTimestamp(),
+        });
+        flash("Thanks, our moderators will review this report.", "ok");
+      } else if (t.dataset.del && claims.admin) {
+        const batch = writeBatch(db);
+        batch.delete(doc(db, "lobby", t.dataset.del));
+        batch.set(doc(collection(db, "auditLog")), auditEntry("delete_message", t.dataset.del, "Lobby message removed by moderator"));
+        await batch.commit();
+      }
+    } catch (err) { flash(friendly(err)); }
+  };
+
+  if (canPost) {
+    el("send").onsubmit = async (e) => {
+      e.preventDefault();
+      const ta = e.target.body;
+      const body = ta.value.trim();
+      if (!body) return;
+      ta.value = "";
+      try {
+        const batch = writeBatch(db);
+        batch.set(doc(db, "lobbyState", user.uid), { lastPostAt: serverTimestamp() });
+        batch.set(doc(collection(db, "lobby")), {
+          senderId: user.uid, name: user.isAnonymous ? guest.nickname : profile.name, body, createdAt: serverTimestamp(),
+        });
+        await batch.commit();
+      } catch (err) {
+        ta.value = body;
+        flash("Message not sent. Please wait a few seconds between messages.");
+      }
+    };
+  }
+}
+
+// ------------------------------------------------------------------ admin (Firestore rules enforce everything here)
+const adminTabs = `<p><a href="#/admin">Members</a> · <a href="#/admin/conversations">Conversations</a> ·
+  <a href="#/admin/reports">Reports</a> · <a href="#/admin/audit">Audit log</a></p>`;
+
+const auditEntry = (action, target, reason) => ({
+  adminUid: user.uid, adminEmail: user.email, action, target, reason, createdAt: serverTimestamp(),
+});
+
+async function pageAdmin(sub) {
+  if (!requireVerified()) return;
+  if (!claims.admin) return render('<div class="card"><h2>Forbidden</h2><p>Admins only.</p></div>');
+
+  if (sub === "conversations") {
+    const snap = await getDocs(query(collection(db, "conversations"), orderBy("updatedAt", "desc"), limit(200)));
+    const rows = [];
+    for (const d of snap.docs) {
+      const names = await Promise.all(d.data().participants.map(nameOf));
+      rows.push({ id: d.id, names, at: d.data().updatedAt?.toMillis?.() });
+    }
+    return render(`<h2>Conversations</h2>${adminTabs}
+      <p class="muted">Opening a conversation requires a written reason and is recorded in the audit log. Review only to handle reports or enforce the Terms.</p>
+      <div class="card" style="overflow-x:auto"><table><tr><th>Between</th><th>Last activity</th><th></th></tr>
+      ${rows.map((c) => `<tr><td>${esc(c.names.join(" & "))}</td><td>${esc(fmt(c.at))}</td>
+        <td><a href="#/admin/thread/${esc(c.id)}">Open</a></td></tr>`).join("") || '<tr><td colspan="3" class="muted">No conversations yet.</td></tr>'}
+      </table></div>`);
+  }
+
+  if (sub === "thread") {
+    const convId = location.hash.split("/")[3] || "";
+    const [a, b] = convId.split("_");
+    if (!a || !b) return go("#/admin/conversations");
+    const reason = prompt("Reason for viewing this conversation (recorded in the audit log):");
+    if (!reason || reason.trim().length < 5) {
+      flash("A reason of at least 5 characters is required to open a conversation.");
+      return go("#/admin/conversations");
+    }
+    // 1) audit entry + 10-minute access grant in ONE batch (rules reject a grant without a fresh audit entry)
+    const auditRef = doc(collection(db, "auditLog"));
+    const batch = writeBatch(db);
+    batch.set(auditRef, auditEntry("view_conversation", convId, reason.trim().slice(0, 300)));
+    batch.set(doc(db, "accessGrants", `${user.uid}_${convId}`), {
+      adminUid: user.uid, convId, auditId: auditRef.id, viewedAt: serverTimestamp(),
+    });
+    await batch.commit();
+    // 2) now the messages become readable
+    const [msgs, nameA, nameB, emailA, emailB] = await Promise.all([
+      getDocs(query(collection(db, "conversations", convId, "messages"), orderBy("createdAt"), limit(1000))),
+      nameOf(a), nameOf(b),
+      getDoc(doc(db, "userPrivate", a)), getDoc(doc(db, "userPrivate", b)),
+    ]);
+    const names = { [a]: nameA, [b]: nameB };
+    return render(`<p><a href="#/admin/conversations">&larr; All conversations</a></p>
+      <div class="card"><h3>${esc(nameA)} (${esc(emailA.data()?.email || "")}) &amp; ${esc(nameB)} (${esc(emailB.data()?.email || "")})</h3>
+      <div class="thread">${msgs.docs.map((d) => { const m = d.data(); return `<div class="msg ${m.senderId === a ? "mine" : ""}">
+        <b>${esc(names[m.senderId] || "?")}:</b> ${esc(m.body)}<small>${esc(fmt(m.createdAt?.toMillis?.()))}</small></div>`; }).join("")
+        || '<p class="muted">No messages.</p>'}</div></div>`);
+  }
+
+  if (sub === "reports") {
+    const snap = await getDocs(query(collection(db, "reports"), orderBy("createdAt", "desc"), limit(200)));
+    const rows = [];
+    for (const d of snap.docs) {
+      const r = d.data();
+      rows.push({ id: d.id, ...r, reporter: await nameOf(r.reporterId), reported: await nameOf(r.reportedId), at: r.createdAt?.toMillis?.() });
+    }
+    render(`<h2>Reports</h2>${adminTabs}<div class="card" style="overflow-x:auto"><table>
+      <tr><th>When</th><th>Reporter</th><th>Reported</th><th>Reason</th><th></th></tr>
+      ${rows.map((r) => `<tr><td>${esc(fmt(r.at))}</td><td>${esc(r.reporter)}</td><td>${esc(r.reported)}</td><td>${esc(r.reason)}</td>
+        <td>${r.resolved ? '<span class="badge ok">resolved</span>' : `<button class="link" data-resolve="${esc(r.id)}">Mark resolved</button>`}</td></tr>`).join("")
+        || '<tr><td colspan="5" class="muted">No reports.</td></tr>'}</table></div>`);
+    document.querySelectorAll("[data-resolve]").forEach((b) => {
+      b.onclick = async () => {
+        try {
+          const batch = writeBatch(db);
+          batch.update(doc(db, "reports", b.dataset.resolve), { resolved: true });
+          batch.set(doc(collection(db, "auditLog")), auditEntry("resolve_report", b.dataset.resolve, "Report resolved in admin panel"));
+          await batch.commit();
+          route();
+        } catch (err) { flash(friendly(err)); }
+      };
+    });
+    return;
+  }
+
+  if (sub === "audit") {
+    const snap = await getDocs(query(collection(db, "auditLog"), orderBy("createdAt", "desc"), limit(300)));
+    return render(`<h2>Audit log</h2>${adminTabs}<div class="card" style="overflow-x:auto"><table>
+      <tr><th>When</th><th>Admin</th><th>Action</th><th>Target</th><th>Reason</th></tr>
+      ${snap.docs.map((d) => { const e = d.data(); return `<tr><td>${esc(fmt(e.createdAt?.toMillis?.()))}</td><td>${esc(e.adminEmail)}</td><td>${esc(e.action)}</td><td>${esc(e.target)}</td><td>${esc(e.reason)}</td></tr>`; }).join("")
+        || '<tr><td colspan="5" class="muted">Nothing logged yet.</td></tr>'}</table></div>`);
+  }
+
+  // Members overview
+  const [gsnap, users, priv, cUsers, cReports] = await Promise.all([
+    getDocs(query(collection(db, "guests"), limit(300))),
+    getDocs(query(collection(db, "users"), where("hidden", "==", false), limit(300))),
+    getDocs(query(collection(db, "userPrivate"), limit(500))),
+    getCountFromServer(query(collection(db, "users"), where("hidden", "==", false))),
+    getCountFromServer(query(collection(db, "reports"), where("resolved", "==", false))),
+  ]);
+  const emails = Object.fromEntries(priv.docs.map((d) => [d.id, d.data().email]));
+  const rows = users.docs.map((d) => ({ uid: d.id, ...d.data() }))
+    .sort((x, y) => (y.createdAt?.toMillis?.() || 0) - (x.createdAt?.toMillis?.() || 0));
+  render(`<h2>Admin</h2>${adminTabs}
+    <div class="stats">
+      <div class="stat"><b>${cUsers.data().count}</b>Members</div>
+      <div class="stat"><b>${cReports.data().count}</b>Open reports</div></div>
+    <div class="card" style="overflow-x:auto"><table>
+      <tr><th>Name</th><th>Email</th><th>City</th><th>Status</th><th></th></tr>
+      ${rows.map((u) => `<tr><td>${esc(u.name)}</td><td>${esc(emails[u.uid] || "")}</td><td>${esc(u.city)}</td>
+        <td>${u.banned ? '<span class="badge err">banned</span>' : '<span class="badge ok">active</span>'}</td>
+        <td><button class="link" data-ban="${esc(u.uid)}" data-state="${u.banned ? "1" : "0"}">${u.banned ? "Unban" : "Ban"}</button></td></tr>`).join("")}
+    </table></div>
+    <h3>Guests</h3><div class="card" style="overflow-x:auto"><table>
+      <tr><th>Nickname</th><th>Joined</th><th>Status</th><th></th></tr>
+      ${gsnap.docs.map((d) => { const g = d.data(); return `<tr><td>${esc(g.nickname)}</td><td>${esc(fmt(g.createdAt?.toMillis?.()))}</td>
+        <td>${g.banned ? '<span class="badge err">banned</span>' : '<span class="badge ok">active</span>'}</td>
+        <td><button class="link" data-gban="${esc(d.id)}" data-state="${g.banned ? "1" : "0"}">${g.banned ? "Unban" : "Ban"}</button></td></tr>`; }).join("")
+        || '<tr><td colspan="4" class="muted">No guests yet.</td></tr>'}
+    </table></div>`);
+  document.querySelectorAll("[data-ban]").forEach((b) => {
+    b.onclick = async () => {
+      const ban = b.dataset.state !== "1";
+      if (ban && !confirm("Ban this member? They will be signed out and unable to chat.")) return;
+      try {
+        const batch = writeBatch(db);
+        batch.update(doc(db, "users", b.dataset.ban), { banned: ban });
+        batch.set(doc(collection(db, "auditLog")), auditEntry(ban ? "ban" : "unban", b.dataset.ban, `${ban ? "Ban" : "Unban"} from admin panel`));
+        await batch.commit();
+        route();
+      } catch (err) { flash(friendly(err)); }
+    };
+  });
+
+  document.querySelectorAll("[data-gban]").forEach((b) => {
+    b.onclick = async () => {
+      const ban = b.dataset.state !== "1";
+      try {
+        const batch = writeBatch(db);
+        batch.update(doc(db, "guests", b.dataset.gban), { banned: ban });
+        batch.set(doc(collection(db, "auditLog")), auditEntry(ban ? "ban_guest" : "unban_guest", b.dataset.gban, `${ban ? "Ban" : "Unban"} guest from admin panel`));
+        await batch.commit();
+        route();
+      } catch (err) { flash(friendly(err)); }
+    };
+  });
+}

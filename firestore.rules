@@ -1,0 +1,245 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------ helpers
+    function signedIn() { return request.auth != null; }
+    function verified() { return signedIn() && request.auth.token.email_verified == true; }
+    function isAdmin() { return signedIn() && request.auth.token.admin == true; }
+    function me() { return request.auth.uid; }
+    function notBanned() {
+      return get(/databases/$(database)/documents/users/$(me())).data.banned == false;
+    }
+    // A normal member in good standing: verified email and not banned.
+    function active() { return verified() && notBanned(); }
+
+    // Guests use Firebase anonymous sign-in. They get the public lobby only.
+    function isGuest() { return signedIn() && request.auth.token.firebase.sign_in_provider == 'anonymous'; }
+    function guestOk() {
+      return isGuest()
+        && exists(/databases/$(database)/documents/guests/$(me()))
+        && get(/databases/$(database)/documents/guests/$(me())).data.banned == false;
+    }
+    function canLobby() { return guestOk() || active(); }
+    function lobbyName() {
+      return isGuest()
+        ? get(/databases/$(database)/documents/guests/$(me())).data.nickname
+        : get(/databases/$(database)/documents/users/$(me())).data.name;
+    }
+
+    // Conversation ids are "<uidA>_<uidB>" with uidA < uidB.
+    function validConvId(convId) {
+      let p = convId.split('_');
+      return p.size() == 2 && p[0] < p[1] && me() in p;
+    }
+    function otherUser(convId) {
+      let p = convId.split('_');
+      return p[0] == me() ? p[1] : p[0];
+    }
+    function notBlocked(convId) {
+      let other = otherUser(convId);
+      return !exists(/databases/$(database)/documents/blocks/$(me() + '_' + other))
+          && !exists(/databases/$(database)/documents/blocks/$(other + '_' + me()));
+    }
+
+    // ------------------------------------------------------------ profiles
+    function validProfileFields(d) {
+      return d.name is string && d.name.size() >= 2 && d.name.size() <= 40
+        && d.city is string && d.city.size() >= 2 && d.city.size() <= 60
+        && d.bio is string && d.bio.size() <= 500
+        && d.gender in ['male', 'female']
+        && d.lookingFor in ['male', 'female']
+        && d.dob is timestamp
+        // 18 years (6575 days is the conservative upper bound incl. leap days)
+        && d.dob <= request.time - duration.value(6575, 'd');
+    }
+
+    match /users/{uid} {
+      allow get: if signedIn() && (me() == uid || isAdmin() || active());
+      allow list: if isAdmin() || active();
+
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['name', 'dob', 'gender', 'lookingFor', 'city', 'bio',
+                                                 'adultConfirmed', 'consentAt', 'createdAt', 'banned', 'hidden'])
+        && request.resource.data.keys().hasAll(['name', 'dob', 'gender', 'lookingFor', 'city', 'bio',
+                                                'adultConfirmed', 'consentAt', 'createdAt', 'banned', 'hidden'])
+        && validProfileFields(request.resource.data)
+        && request.resource.data.adultConfirmed == true
+        && request.resource.data.consentAt == request.time
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.banned == false
+        && request.resource.data.hidden == false;
+
+      allow update:
+        // owner: only name/city/bio, and never while banned
+        if (signedIn() && me() == uid
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'city', 'bio'])
+              && validProfileFields(request.resource.data)
+              && resource.data.banned == false)
+        // admin: may only flip "banned", and never on admin accounts (they are hidden)
+        || (isAdmin()
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['banned'])
+              && resource.data.hidden == false);
+
+      allow delete: if false;
+    }
+
+    // Email lives here (not in the public profile). Owner and admins only.
+    match /userPrivate/{uid} {
+      allow read: if signedIn() && (me() == uid || isAdmin());
+      allow create: if signedIn() && me() == uid
+        && request.resource.data.keys().hasOnly(['email'])
+        && request.resource.data.email == request.auth.token.email;
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------ blocks
+    match /blocks/{blockId} {
+      allow read: if active() && resource.data.blockerId == me();
+      allow create: if active()
+        && request.resource.data.keys().hasOnly(['blockerId', 'blockedId', 'createdAt'])
+        && request.resource.data.blockerId == me()
+        && request.resource.data.blockedId is string
+        && request.resource.data.blockedId != me()
+        && blockId == me() + '_' + request.resource.data.blockedId
+        && request.resource.data.createdAt == request.time;
+      allow delete: if active() && resource.data.blockerId == me();
+      allow update: if false;
+    }
+
+    // ------------------------------------------------------------ reports
+    match /reports/{reportId} {
+      allow create: if (active() || guestOk())
+        && request.resource.data.keys().hasOnly(['reporterId', 'reportedId', 'reason', 'resolved', 'createdAt'])
+        && request.resource.data.reporterId == me()
+        && request.resource.data.reportedId is string
+        && request.resource.data.reportedId != me()
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() >= 1 && request.resource.data.reason.size() <= 500
+        && request.resource.data.resolved == false
+        && request.resource.data.createdAt == request.time;
+      allow read: if isAdmin();
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['resolved']);
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------ audit log + access grants
+    // Append-only. Admins can write entries about themselves, never edit or delete them.
+    match /auditLog/{auditId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['adminUid', 'adminEmail', 'action', 'target', 'reason', 'createdAt'])
+        && request.resource.data.adminUid == me()
+        && request.resource.data.adminEmail == request.auth.token.email
+        && request.resource.data.action in ['view_conversation', 'ban', 'unban', 'resolve_report',
+                                         'ban_guest', 'unban_guest', 'delete_message']
+        && request.resource.data.target is string
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() >= 5 && request.resource.data.reason.size() <= 300
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    function auditAfter(auditId) {
+      return getAfter(/databases/$(database)/documents/auditLog/$(auditId)).data;
+    }
+
+    // A grant lets an admin read ONE conversation for 10 minutes. It can only be written in the
+    // same batch as a brand-new audit entry (createdAt == request.time) for that conversation.
+    match /accessGrants/{grantId} {
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['adminUid', 'convId', 'auditId', 'viewedAt'])
+        && request.resource.data.adminUid == me()
+        && grantId == me() + '_' + request.resource.data.convId
+        && request.resource.data.viewedAt == request.time
+        && auditAfter(request.resource.data.auditId).adminUid == me()
+        && auditAfter(request.resource.data.auditId).action == 'view_conversation'
+        && auditAfter(request.resource.data.auditId).target == request.resource.data.convId
+        && auditAfter(request.resource.data.auditId).createdAt == request.time;
+      allow read, delete: if false;
+    }
+
+    function adminGranted(convId) {
+      let g = /databases/$(database)/documents/accessGrants/$(me() + '_' + convId);
+      return isAdmin() && exists(g) && get(g).data.viewedAt > request.time - duration.value(10, 'm');
+    }
+
+    // ------------------------------------------------------------ conversations & messages
+    function validConvFields(d, convId) {
+      return d.keys().hasOnly(['participants', 'updatedAt'])
+        && d.participants == convId.split('_')
+        && d.updatedAt == request.time;
+    }
+
+    match /conversations/{convId} {
+      // Metadata only (who talked, when). Message text is never stored here.
+      allow read: if isAdmin() || (active() && me() in resource.data.participants);
+      allow create: if active() && validConvId(convId)
+        && validConvFields(request.resource.data, convId)
+        && notBlocked(convId);
+      allow update: if active() && me() in resource.data.participants
+        && validConvFields(request.resource.data, convId)
+        && notBlocked(convId);
+      allow delete: if false;
+
+      match /messages/{msgId} {
+        allow read: if (active() && validConvId(convId)) || adminGranted(convId);
+        allow create: if active() && validConvId(convId) && notBlocked(convId)
+          && request.resource.data.keys().hasOnly(['senderId', 'body', 'createdAt'])
+          && request.resource.data.senderId == me()
+          && request.resource.data.body is string
+          && request.resource.data.body.size() >= 1 && request.resource.data.body.size() <= 2000
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+
+    // ------------------------------------------------------------ guests & public lobby
+    match /guests/{uid} {
+      allow get: if signedIn() && (me() == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isGuest() && me() == uid
+        && request.resource.data.keys().hasOnly(['nickname', 'dob', 'adultConfirmed', 'consentAt', 'createdAt', 'banned'])
+        && request.resource.data.nickname is string
+        && request.resource.data.nickname.size() >= 2 && request.resource.data.nickname.size() <= 20
+        && request.resource.data.dob is timestamp
+        && request.resource.data.dob <= request.time - duration.value(6575, 'd')
+        && request.resource.data.adultConfirmed == true
+        && request.resource.data.consentAt == request.time
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.banned == false;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['banned']);
+      allow delete: if false;
+    }
+
+    // Written together with every lobby post; used to enforce a 3-second gap between posts.
+    match /lobbyState/{uid} {
+      allow create, update: if me() == uid && canLobby()
+        && request.resource.data.keys().hasOnly(['lastPostAt'])
+        && request.resource.data.lastPostAt == request.time;
+      allow read, delete: if false;
+    }
+
+    match /lobby/{msgId} {
+      allow read: if isAdmin() || canLobby();
+      allow create: if canLobby()
+        && request.resource.data.keys().hasOnly(['senderId', 'name', 'body', 'createdAt'])
+        && request.resource.data.senderId == me()
+        && request.resource.data.name == lobbyName()
+        && request.resource.data.body is string
+        && request.resource.data.body.size() >= 1 && request.resource.data.body.size() <= 500
+        && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/lobbyState/$(me())).data.lastPostAt == request.time
+        && (!exists(/databases/$(database)/documents/lobbyState/$(me()))
+            || get(/databases/$(database)/documents/lobbyState/$(me())).data.lastPostAt <= request.time - duration.value(3, 's'));
+      allow delete: if isAdmin();
+      allow update: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

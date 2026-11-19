@@ -1,0 +1,13 @@
+# Never commit credentials
+*.json.key
+service-account*.json
+*-firebase-adminsdk-*.json
+serviceAccount*.json
+.env
+.env.*
+
+node_modules/
+.firebase/
+firebase-debug.log
+*.log
+.DS_Store
