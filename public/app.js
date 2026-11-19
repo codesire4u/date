@@ -161,7 +161,7 @@ const selfRecord = () => (user.isAnonymous ? guest : profile);
 
 // ------------------------------------------------------------------ icons & small helpers
 const ICONS = {
-  flame: "M19.48 12.35c-1.57-4.08-7.16-4.3-5.81-10.23.1-.44-.37-.78-.75-.55C9.29 3.71 6.68 8 8.87 13.62c.18.46-.36.89-.75.59-1.81-1.37-2-3.34-1.84-4.75.06-.52-.62-.77-.91-.34C4.69 10.16 4 11.84 4 14.37c.38 5.68 5.91 7.14 7.87 7.39 2.46.31 5.31-.14 7.04-2.36 1.89-2.43 1.41-5.19.57-7.05z",
+  flame: "M2 12C4.5 9.2 7 7.2 9.2 7.4C10.6 7.5 11.4 8.2 12 9C12.6 8.2 13.4 7.5 14.8 7.4C17 7.2 19.5 9.2 22 12C19 12.9 15.5 13.2 12 13.2C8.5 13.2 5 12.9 2 12ZM2.6 13C5.6 13.8 8.8 14.1 12 14.1C15.2 14.1 18.4 13.8 21.4 13C20 16.6 16.5 18.8 12 18.8C7.5 18.8 4 16.6 2.6 13Z",
   heart: "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z",
   close: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
   chat: "M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z",
@@ -179,6 +179,8 @@ const ICONS = {
   check: "M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z",
 };
 const ic = (n) => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[n]}"/></svg>`;
+const LOADING_LINES = ["Fixing our lipstick…", "Batting our eyelashes…", "Finding someone cute…", "Warming things up…", "Playing it cool… almost there", "Checking who's online 👀"];
+const loadingHtml = (line) => `<div class="loading">${ic("flame")}<p>${line || LOADING_LINES[Math.floor(Math.random() * LOADING_LINES.length)]}</p></div>`;
 const lsGet = (k, d = null) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (_) { return d; } };
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} };
 const pairId = (a, b) => [a, b].sort().join("_");
@@ -287,13 +289,13 @@ function renderNav(page, arg) {
   document.body.classList.toggle("wide", page === "admin");
   document.body.dataset.page = page;
   document.body.dataset.full = ((page === "chat" && arg) || page === "profile") ? "1" : "0";
-  const t = (href, icon, label, on, extra = "") => `<a href="${href}" class="${on ? "on" : ""}">${ic(icon)}<span>${label}</span>${extra}</a>`;
+  const t = (href, icon, label, on, extra = "") => `<a href="${href}" class="${on ? "on" : ""}" aria-label="${label}" title="${label}">${ic(icon)}${extra}</a>`;
   const msgOn = page === "chat" || page === "requests";
   const msgTab = t("#/chat", "chat", "Messages", msgOn, '<b class="bdg" id="reqbadge" hidden></b>');
   el("tabs").innerHTML = !user ? ""
     : user.isAnonymous
       ? t("#/online", "people", "Online", page === "online") + t("#/random", "shuffle", "Random", page === "random") + msgTab + t("#/register", "person", "Sign up", false)
-      : t("#/browse", "flame", "Discover", page === "browse") + t("#/online", "people", "Online", page === "online")
+      : t("#/browse", "heart", "Discover", page === "browse") + t("#/online", "people", "Online", page === "online")
         + t("#/random", "shuffle", "Random", page === "random") + msgTab + t("#/me", "person", "Profile", page === "me");
   el("nav").innerHTML = !user ? '<a href="#/login">Log in</a>'
     : user.isAnonymous ? '<a class="btn sm" href="#/register">Sign up</a>' : "";
@@ -348,14 +350,15 @@ function pageHome() {
   if (user && user.isAnonymous && guest) return go("#/online");
   render(`<section class="landing"><div>
     <div class="brand">${ic("flame")}desire</div>
-    <h1>Meet someone real.</h1>
+    <h1>Feeling a little curious? 😉</h1>
+    <p class="sub2">Real people. Real chemistry. Zero catfish.</p>
     <div class="perks">
-      <div class="perk">${ic("check")}<div><b>Adults only</b><span>18+, confirmed at sign-up</span></div></div>
-      <div class="perk">${ic("person")}<div><b>Real people</b><span>Every member verifies their email</span></div></div>
-      <div class="perk">${ic("heart")}<div><b>You set the pace</b><span>Block or report anyone, anytime</span></div></div>
+      <div class="perk">${ic("check")}<div><b>Adults only</b><span>18+ only, because things get interesting</span></div></div>
+      <div class="perk">${ic("person")}<div><b>Real people</b><span>Everyone is verified, so no catfish</span></div></div>
+      <div class="perk">${ic("heart")}<div><b>You set the pace</b><span>Slow burn or fast spark, your call</span></div></div>
     </div>
-    <a class="btn big" href="#/register">Create account</a>
-    <a class="btn ghost big" href="#/login">Log in</a>
+    <a class="btn big" href="#/register">Join the fun</a>
+    <a class="btn ghost big" href="#/login">I'm already hooked</a>
     <p><a class="link" href="#/guest">Continue as guest</a></p>
     <p class="fine">By continuing you confirm you are 18 or older and accept our <a href="#/terms">Terms</a>.</p>
   </div></section>`);
@@ -453,11 +456,11 @@ function pageRegister() {
 
 function pageLogin() {
   if (user && !user.isAnonymous) return go("#/browse");
-  render(`<div class="card narrow small"><h2>Log in</h2><form id="f">
-    <label>Email</label><input type="email" name="email" required>
-    <label>Password</label><input type="password" name="password" required>
-    <p><button type="submit">Log in</button></p>
-    <p class="muted">New here? <a href="#/register">Create an account</a></p></form></div>`);
+  render(`<div class="card narrow small"><h2>Well, hello again 😉</h2><p class="muted flirt">We missed you. Log in and see who's been thinking about you.</p><form id="f">
+    <label>Your email</label><input type="email" name="email" required placeholder="you@gorgeous.com">
+    <label>Secret password</label><input type="password" name="password" required>
+    <p><button type="submit">Let me in 💋</button></p>
+    <p class="muted">New here? <a href="#/register">Come say hi, create an account</a></p></form></div>`);
   el("f").onsubmit = async (e) => {
     e.preventDefault();
     const f = e.target;
@@ -581,7 +584,7 @@ async function pageBrowse() {
   if (!profile) return render('<div class="card"><p>No member profile found for this account.</p></div>');
   const geo = hasCell(profile), maxKm = Number(lsGet("desire_km", "0")) || 0;
   render(`${profile.thumb ? "" : '<a class="nudge" href="#/me/edit">Add a photo to get more matches</a>'}
-    <div class="deckwrap"><div class="deck" id="deck"><div class="empty"><p>Finding people…</p></div></div>
+    <div class="deckwrap"><div class="deck" id="deck"><div class="empty">${loadingHtml("Finding someone cute…")}</div></div>
     <div class="acts" id="acts"><button class="rb pass" id="bPass" aria-label="Pass">${ic("close")}</button>
       <button class="rb msg" id="bMsg" aria-label="Message">${ic("chat")}</button>
       <button class="rb like" id="bLike" aria-label="Like">${ic("heart")}</button></div></div>`);
@@ -882,7 +885,7 @@ async function pageOnline() {
   let who = "", people = [];
   render(`<div class="bar"><h2>Online now <i class="on"></i></h2></div>
     <div class="seg" id="seg"><button data-w="" class="act">Everyone</button><button data-w="female">Women</button><button data-w="male">Men</button></div>
-    <div class="tiles" id="tiles"><p class="muted">Loading…</p></div>`);
+    <div class="tiles" id="tiles">${loadingHtml("Checking who's online 👀")}</div>`);
 
   const draw = () => {
     const list = people.filter((p) => !who || p.gender === who).map((p) => ({
@@ -923,7 +926,7 @@ async function pageInbox(tab) {
   if (!requireChatter()) return;
   render(`<div class="bar"><h2>Messages</h2></div>
     <div class="seg"><a href="#/chat" class="${tab === "chats" ? "act" : ""}">Chats</a><a href="#/requests" class="${tab === "requests" ? "act" : ""}">Requests</a></div>
-    <div id="list"><p class="muted">Loading…</p></div>`);
+    <div id="list">${loadingHtml("Opening your secret admirers…")}</div>`);
   let token = 0;
   const draw = async () => {
     const my = ++token;
