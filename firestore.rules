@@ -13,19 +13,14 @@ service cloud.firestore {
     // A normal member in good standing: verified email and not banned.
     function active() { return verified() && notBanned(); }
 
-    // Guests use Firebase anonymous sign-in. They get the public lobby only.
+    // Guests use Firebase anonymous sign-in. They can chat (requests, online, blind chat) but cannot send pictures or like.
     function isGuest() { return signedIn() && request.auth.token.firebase.sign_in_provider == 'anonymous'; }
     function guestOk() {
       return isGuest()
         && exists(/databases/$(database)/documents/guests/$(me()))
         && get(/databases/$(database)/documents/guests/$(me())).data.banned == false;
     }
-    function canLobby() { return guestOk() || active(); }
-    function lobbyName() {
-      return isGuest()
-        ? get(/databases/$(database)/documents/guests/$(me())).data.nickname
-        : get(/databases/$(database)/documents/users/$(me())).data.name;
-    }
+    function canLobby() { return guestOk() || active(); }   // "can chat": member in good standing or guest in good standing
 
     // Conversation ids are "<uidA>_<uidB>" with uidA < uidB.
     function validConvId(convId) {
@@ -52,7 +47,8 @@ service cloud.firestore {
         && d.dob is timestamp
         // 18 years (6575 days is the conservative upper bound incl. leap days)
         && d.dob <= request.time - duration.value(6575, 'd')
-        && validGeo(d);
+        && validGeo(d)
+        && validExtra(d);
     }
 
     // Optional coarse location: integer grid cell (~5 km), both fields or neither.
@@ -60,6 +56,16 @@ service cloud.firestore {
       return (('gx' in d) == ('gy' in d))
         && (!('gx' in d) || (d.gx is int && d.gy is int
             && d.gx >= -1800 && d.gx <= 1800 && d.gy >= -3600 && d.gy <= 3600));
+    }
+
+    // Optional "more about me" fields and the small main-photo thumbnail.
+    function validExtra(d) {
+      return (!('job' in d) || (d.job is string && d.job.size() <= 60))
+        && (!('school' in d) || (d.school is string && d.school.size() <= 60))
+        && (!('height' in d) || (d.height is int && d.height >= 120 && d.height <= 230))
+        && (!('goal' in d) || d.goal in ['long', 'short', 'friends', 'open'])
+        && (!('interests' in d) || (d.interests is list && d.interests.size() <= 6))
+        && (!('thumb' in d) || (d.thumb is string && d.thumb.size() <= 80000));
     }
 
     match /users/{uid} {
@@ -81,9 +87,10 @@ service cloud.firestore {
         && request.resource.data.hidden == false;
 
       allow update:
-        // owner: only name/city/bio and the optional coarse location, never while banned
+        // owner: profile text, extra info, thumbnail and the optional coarse location, never while banned
         if (signedIn() && me() == uid
-              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'city', 'bio', 'gx', 'gy'])
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'city', 'bio', 'gx', 'gy',
+                                                                                   'thumb', 'job', 'school', 'height', 'goal', 'interests'])
               && validProfileFields(request.resource.data)
               && resource.data.banned == false)
         // presence: owner may stamp (or clear) only "lastSeen"; the stamp must be the server time
@@ -99,12 +106,43 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // Up to 4 profile photos (compressed JPEG data URLs). Readable by members and guests, writable by the owner only.
+    function okPic(p, i) {
+      return p.size() <= i || (p[i] is string && p[i].size() > 100 && p[i].size() <= 200000);
+    }
+    function validPhotos(d) {
+      return d.keys().hasOnly(['p', 'updatedAt'])
+        && d.p is list && d.p.size() <= 4
+        && okPic(d.p, 0) && okPic(d.p, 1) && okPic(d.p, 2) && okPic(d.p, 3)
+        && d.updatedAt == request.time;
+    }
+    match /photos/{uid} {
+      allow get: if signedIn() && (me() == uid || isAdmin() || active() || guestOk());
+      allow list: if false;
+      allow create, update: if active() && me() == uid && validPhotos(request.resource.data);
+      allow delete: if active() && me() == uid;
+    }
+
     // Email lives here (not in the public profile). Owner and admins only.
     match /userPrivate/{uid} {
       allow read: if signedIn() && (me() == uid || isAdmin());
       allow create: if signedIn() && me() == uid
         && request.resource.data.keys().hasOnly(['email'])
         && request.resource.data.email == request.auth.token.email;
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------ likes (swipe right). Members only.
+    // A like is readable by the two people involved, so a match can be detected.
+    match /likes/{likeId} {
+      allow read: if active() && (resource.data.from == me() || resource.data.to == me());
+      allow create: if active()
+        && request.resource.data.keys().hasOnly(['from', 'to', 'createdAt'])
+        && request.resource.data.from == me()
+        && request.resource.data.to is string
+        && request.resource.data.to != me()
+        && likeId == me() + '_' + request.resource.data.to
+        && request.resource.data.createdAt == request.time;
       allow update, delete: if false;
     }
 
@@ -181,36 +219,98 @@ service cloud.firestore {
     }
 
     // ------------------------------------------------------------ conversations & messages
-    function validConvFields(d, convId) {
-      return d.keys().hasOnly(['participants', 'updatedAt'])
+    // status: 'request'  first contact. The sender (initiator) may send at most 2 messages (reqCount) until the
+    //                    other person accepts. The receiver sees it under "Requests", not in the inbox.
+    //         'accepted' normal chat (replying, accepting, or a mutual like/match makes it accepted)
+    //         'declined' the receiver declined; the sender can't send more
+    // Conversations created before this feature have no status and count as 'accepted'.
+    function convPath(convId) { return /databases/$(database)/documents/conversations/$(convId); }
+
+    // Both people liked each other (my like is created in this same commit or already exists).
+    function mutualLike(convId) {
+      let o = otherUser(convId);
+      return existsAfter(/databases/$(database)/documents/likes/$(me() + '_' + o))
+          && exists(/databases/$(database)/documents/likes/$(o + '_' + me()));
+    }
+
+    function validNewConv(d, convId) {
+      return d.keys().hasOnly(['participants', 'updatedAt', 'initiator', 'status', 'reqCount'])
         && d.participants == convId.split('_')
-        && d.updatedAt == request.time;
+        && d.updatedAt == request.time
+        && d.initiator == me()
+        && ((d.status == 'request' && d.reqCount == 1)
+            || (d.status == 'accepted' && d.reqCount == 0 && mutualLike(convId)));
+    }
+
+    // A message may only be written in the same commit that updates its conversation, and only if the
+    // conversation state allows it.
+    function msgOk(convId) {
+      let p = convPath(convId);
+      let aft = getAfter(p).data;
+      return aft.updatedAt == request.time
+        && (
+          // brand-new request: the very first message
+          (!exists(p) && aft.status == 'request' && aft.initiator == me() && aft.reqCount == 1)
+          // accepted chat (also older conversations without a status)
+          || (exists(p) && get(p).data.get('status', 'accepted') == 'accepted' && aft.get('status', 'accepted') == 'accepted')
+          // the receiver replies: that accepts the request
+          || (exists(p) && get(p).data.get('status', 'accepted') == 'request' && get(p).data.initiator != me()
+              && aft.status == 'accepted')
+          // the sender writes again before being accepted: at most 2 in total
+          || (exists(p) && get(p).data.get('status', 'accepted') == 'request' && get(p).data.initiator == me()
+              && aft.status == 'request' && aft.reqCount <= 2)
+        );
     }
 
     match /conversations/{convId} {
-      // Metadata only (who talked, when). Message text is never stored here.
+      // Metadata only (who talked, when, request state). Message text is never stored here.
       allow read: if isAdmin() || (canLobby() && me() in resource.data.participants);
       allow create: if canLobby() && validConvId(convId)
-        && validConvFields(request.resource.data, convId)
+        && validNewConv(request.resource.data, convId)
         && notBlocked(convId);
-      allow update: if canLobby() && me() in resource.data.participants
-        && validConvFields(request.resource.data, convId)
-        && notBlocked(convId);
+      allow update: if canLobby() && me() in resource.data.participants && notBlocked(convId) && (
+          // sender adds another message to a pending request (max 2)
+          (resource.data.get('status', 'accepted') == 'request' && resource.data.initiator == me()
+            && request.resource.data.status == 'request'
+            && resource.data.reqCount < 2
+            && request.resource.data.reqCount == resource.data.reqCount + 1
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['updatedAt', 'reqCount'])
+            && request.resource.data.updatedAt == request.time)
+          // accepted chat: bump the activity time
+          || (resource.data.get('status', 'accepted') == 'accepted'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['updatedAt'])
+            && request.resource.data.updatedAt == request.time)
+          // accept: by the receiver, or because both people liked each other
+          || (resource.data.get('status', 'accepted') != 'accepted'
+            && request.resource.data.status == 'accepted'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && request.resource.data.updatedAt == request.time
+            && (resource.data.initiator != me() || mutualLike(convId)))
+          // decline: only the receiver of a pending request
+          || (resource.data.get('status', 'accepted') == 'request' && resource.data.initiator != me()
+            && request.resource.data.status == 'declined'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']))
+        );
       allow delete: if false;
 
       match /messages/{msgId} {
         allow read: if (canLobby() && validConvId(convId)) || adminGranted(convId);
-        allow create: if canLobby() && validConvId(convId) && notBlocked(convId)
-          && request.resource.data.keys().hasOnly(['senderId', 'body', 'createdAt'])
+        allow create: if canLobby() && validConvId(convId) && notBlocked(convId) && msgOk(convId)
+          && request.resource.data.keys().hasOnly(['senderId', 'body', 'img', 'createdAt'])
           && request.resource.data.senderId == me()
           && request.resource.data.body is string
-          && request.resource.data.body.size() >= 1 && request.resource.data.body.size() <= 2000
+          && request.resource.data.body.size() <= 2000
+          && (request.resource.data.body.size() >= 1 || 'img' in request.resource.data)
+          // pictures: registered members only (not guests), one compressed JPEG data URL
+          && (!('img' in request.resource.data)
+              || (!isGuest() && request.resource.data.img is string
+                  && request.resource.data.img.size() > 100 && request.resource.data.img.size() <= 180000))
           && request.resource.data.createdAt == request.time;
         allow update, delete: if false;
       }
     }
 
-    // ------------------------------------------------------------ guests & public lobby
+    // ------------------------------------------------------------ guests
     match /guests/{uid} {
       allow get: if signedIn() && (me() == uid || isAdmin());
       allow list: if isAdmin();
@@ -246,32 +346,7 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
-    // Written together with every lobby post; used to enforce a 3-second gap between posts.
-    match /lobbyState/{uid} {
-      allow create, update: if me() == uid && canLobby()
-        && request.resource.data.keys().hasOnly(['lastPostAt'])
-        && request.resource.data.lastPostAt == request.time;
-      allow read, delete: if false;
-    }
-
-    match /lobby/{msgId} {
-      allow read: if isAdmin() || canLobby();
-      allow create: if canLobby()
-        && request.resource.data.keys().hasOnly(['senderId', 'name', 'body', 'createdAt'])
-        && request.resource.data.senderId == me()
-        && request.resource.data.name == lobbyName()
-        && request.resource.data.body is string
-        && request.resource.data.body.size() >= 1 && request.resource.data.body.size() <= 500
-        && request.resource.data.createdAt == request.time
-        && getAfter(/databases/$(database)/documents/lobbyState/$(me())).data.lastPostAt == request.time
-        && (!exists(/databases/$(database)/documents/lobbyState/$(me()))
-            || get(/databases/$(database)/documents/lobbyState/$(me())).data.lastPostAt <= request.time - duration.value(3, 's'));
-      allow delete: if isAdmin();
-      allow update: if false;
-    }
-
-
-    // ------------------------------------------------------------ random blind chat (Omegle-style)
+    // ------------------------------------------------------------ random blind chat
     // Members wait in `waiting/{uid}`. Another member of the OPPOSITE gender claims two waiting
     // entries and creates a room in one transaction. Rules enforce the pairing: both entries must be
     // fresh, still "waiting", and of different genders (gender is copied from the profile on create).

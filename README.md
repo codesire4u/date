@@ -1,7 +1,37 @@
-# Desire: adults-only dating site on Firebase (free Spark plan)
+# Desire: adults-only, Tinder-style dating site on Firebase (free Spark plan)
 
 Stack: static site (GitHub Pages or Firebase Hosting) + Firebase Auth (email/password, built-in email verification)
-+ Firestore with security rules. **No Cloud Functions and no billing account needed.**
++ Firestore with security rules. **No Cloud Functions, no Storage bucket, no billing account needed.**
+
+## What the app does now
+| Area | How it works |
+|---|---|
+| **Home page** | Short landing screen: *Adults only · Real people · You set the pace*, then Create account / Log in / Continue as guest. |
+| **Discover** | Tinder-style card deck. Drag a card right to like, left to pass (or use the buttons); tap a card to open the full profile. People who are online are shown first and have a green dot. Blocked, already-liked and recently passed people are hidden. |
+| **Matches** | If you like someone who already liked you, it is a match: a conversation opens straight in your inbox, with no request step. |
+| **Profile (own)** | **Profile** tab: avatar, name, age, city, job, **Edit profile**, **Preview** (how others see you), "Show me as online" switch, max distance, location sharing, Terms, Log out. |
+| **Edit profile** | Up to **4 photos** (add, remove, "make main"), about me, job, school, height, what you're looking for, up to 6 interests. |
+| **Other profiles** | Photo gallery (tap left/right), name, age, online dot, distance, job/school, bio, looking for, interests, height, Like / Pass / Message, Block, Report. |
+| **Online** | Photo grid of everyone active in the last 7 minutes (heartbeat every 3 minutes; each member can switch it off in Profile). The green dot also shows on cards, profiles, the inbox and chat headers. |
+| **Message requests** | A first message to someone you haven't matched with is sent as a **request**. It does **not** appear in their Chats; it shows under **Messages > Requests** (with a badge). Until they accept, the sender can send **2 messages** (guests too), then the composer is locked. The receiver can **Accept**, **Decline** (sender can't send more) or reply (a reply accepts). |
+| **Pictures in chat** | Registered members (verified email) can send a picture in any chat, including as one of the two request messages. **Guests cannot send pictures** (the rules enforce this). |
+| **Guests** | No email: can see who is online, use Random blind chat and send message requests. They cannot swipe, like, browse everyone or send pictures. |
+| **Lobby** | Removed (page, rules and navigation). Old `lobby` / `lobbyState` documents can be deleted in the console. |
+
+### Where photos live (important)
+Firebase Storage now needs a paid plan, so photos are **compressed in the browser and stored as small JPEG text inside Firestore**:
+`photos/{uid}` holds up to 4 photos (about 600-900 px each, under about 190 KB each) and `users/{uid}.thumb` holds a small 3:4 thumbnail of the main photo used by the swipe deck and lists. Chat pictures are stored in the message (`img`, under about 180 KB). This is fine for launch; if the site grows, move pictures to Cloud Storage / Cloudflare R2 and keep only URLs in Firestore.
+
+### Deploy the update
+```bash
+firebase deploy --only firestore     # publishes the new rules (required)
+```
+Then push `public/` to GitHub (or `firebase deploy --only hosting`). Existing accounts and conversations keep working: older conversations without a `status` count as accepted chats. Existing members simply have no photos yet; the Discover page nudges them to add one.
+
+### Free-plan cost notes
+Each open tab writes `lastSeen` about 20 times an hour. Swiping costs 1 write per like. A deck load reads up to 150 profiles (thumbnails are about 25 KB each). If you outgrow the free quota, lower the deck `limit(150)` in `pageBrowse` or raise `BEAT_MS` in `app.js`.
+
+---
 
 ## Hosting the site on GitHub Pages
 The site is plain static files in `public/`, so GitHub Pages works. Firebase still provides login and the database.
@@ -17,7 +47,7 @@ Notes: the Firebase web config in `public/firebase-config.js` is meant to be pub
 
 ## One-time setup (all free)
 1. Create a project at https://console.firebase.google.com (stay on the free **Spark** plan; do not add billing).
-2. **Authentication > Sign-in method**: enable **Email/Password** and **Anonymous** (Anonymous powers guest chat).
+2. **Authentication > Sign-in method**: enable **Email/Password** and **Anonymous** (Anonymous powers guest sessions).
 3. **Firestore Database**: create a database (production mode).
 4. **Project settings > General > Your apps**: add a **Web app**, copy its config into `public/firebase-config.js`.
 5. Put your project ID in `.firebaserc`.
@@ -41,7 +71,7 @@ Sign out and back in; an **Admin** link appears.
 |---|---|
 | Basic information form | `#/register`: name, DOB, email, password, gender, looking for, city, bio, 18+ and Terms checkboxes |
 | Email mandatory for chat | Firestore rules require a verified email (`email_verified == true`) to read or send any message. Enforced on the server, not just in the UI |
-| Chat without registering | `#/guest`: nickname + date of birth (18+) + Terms, no email. Guests get the **public lobby only**: no profiles, no private messages |
+| Chat without registering | `#/guest`: nickname, gender and 18+ date of birth, no email. Guests can use Online, blind chat and message requests only. |
 | Male/female matching | Discover shows only members whose gender and preference match yours |
 | 18+ | Rules reject profiles under 18 years; DOB and gender can't be edited afterwards |
 | You can check messages | Admin > Conversations (see below) |
@@ -65,20 +95,6 @@ Roughly: Firestore 1 GiB storage and 50,000 reads / 20,000 writes per day; Hosti
 - Add account deletion and a full Terms/Privacy Policy reviewed by a lawyer (age-verification and data-protection rules such as India's DPDP Act vary by country).
 - Customise the verification email template under Authentication > Templates; add a custom domain under Authentication > Settings > Authorized domains.
 
-## Guest chat (no registration): how it's limited
-Email stays mandatory for profiles and private (1-to-1) messages, the only exception is the public lobby. Guests:
-- must enter a date of birth showing 18+ and accept the Terms (including moderation); stored on a `guests` record;
-- can post at most one message every 3 seconds (enforced by the rules), max 500 characters;
-- can report any lobby message; admins can delete messages and ban guests (all recorded in the audit log).
-
-Honest limitations: a guest has no email, so a banned guest can return by clearing browser data and starting a new guest session. Anonymous accounts are also easy to create in bulk. Enable **App Check** (free), watch the lobby, and if abuse grows, make the lobby members-only by removing `guestOk()` from `canLobby()` in `firestore.rules`. Lobby messages are kept until you delete them; prune old ones occasionally to stay inside the free quota.
-
-## Nearby members
-On **Discover**, members can tap "Use my location" to see people close to them and message them. Only a coarse grid cell (about 5 km wide, stored as integers `gx`/`gy` on the profile) is saved, never exact coordinates, and other members only see a range such as "Within 10 km". Members can stop sharing at any time. After updating, **republish `firestore.rules`**: the rules now allow those two optional fields.
-
-## Online members
-The **Online** page lists every member active in the last 6 minutes (a `lastSeen` timestamp refreshed every 4 minutes while the site is open), your own city first, then nearest, with a Message button for each. Members can switch "Show me as online" off. Free-plan note: each open tab writes about 15 times an hour, so keep an eye on the daily write quota (20,000) as you grow. After updating, **republish `firestore.rules`**.
-
 ## Blind chat (Omegle-style random match, opposite gender only)
 **Random** in the menu pairs a verified member with an anonymous member of the **opposite gender** who is searching at the same moment. No Cloud Functions are used.
 
@@ -95,21 +111,17 @@ Limits to know about:
 - Free-plan cost: about 3 writes/min while searching plus 1 per message. Rooms and messages are kept for moderation, so prune old `rooms` occasionally.
 - Gender matching uses the gender on the member's profile (strictly male <-> female), ignoring the "looking for" setting.
 
-## Guests can use everything except Discover
-Guests (anonymous sign-in, nickname + gender + 18+ date of birth, no email) can now use **Lobby, Online, Blind chat and private Messages**. **Discover** (browsing all profiles) stays members-only.
-
-- Guest sign-up now asks for **gender**, which blind chat needs. Guest sessions created earlier are asked once when they open Random.
-- New `guestNames/{uid}` document holds only the nickname, so members can see who messaged them without ever seeing a guest's date of birth.
-- Rules: guests (not banned) pass the same `canLobby()` check as members for blind chat and private conversations. They can open one profile by id and list only members who are online right now (last 10 minutes), never the whole member list.
-- Guests cannot use the Block button (it needs a member account), but they can report. Members can block guests from the chat page.
-- **After updating:** `firebase deploy --only firestore`.
-
-Things to know:
-- Anonymous accounts are cheap to create, so guests can be used for spam or to scrape the Online list (name, city, age, bio of whoever is online). Enable **App Check**, and if abuse appears, remove `guestOk()` from the `users` rules or from the conversation rules.
-- Guests don't appear in the Online list (they have no presence record); they start chats with members.
-- A banned guest is cut off everywhere at once, but can start a new guest session (see the guest limitations above).
-
 ## Troubleshooting blind chat
 The searching screen now shows a status line. "Setup needed ... index" means run `firebase deploy --only firestore` and wait until **Firestore > Indexes** says *Enabled*. "Setup needed ... rules" means the rules were not published. Test with **two different accounts, one male and one female** (the same account on two devices has the same user id and can never match with itself). Matching measures freshness against your own server timestamp, so a wrong phone clock no longer hides people.
 
 **Update:** matching no longer needs any composite index (it uses two equality filters and checks freshness in the browser), so `firebase deploy --only firestore` only has to publish the rules. If the console still lists the old `waiting` index you can delete it. Abandoned queue entries older than 3 minutes can be tidied by any member in good standing.
+
+## Nearby members and location
+In **Profile**, members can tap "Use my location". Only a coarse grid cell (about 5 km, integers `gx`/`gy`) is stored, never exact coordinates; others see a range such as "Within 10 km". The distance limit for Discover is also set in Profile and stored only in the browser.
+
+## Honest limitations
+- Guests have no presence record, so they don't appear in Online (they can still see members who are online, subject to the rules' 10-minute window for guest listing).
+- Anonymous accounts are cheap to create, so guests can be used for spam. Enable **App Check** and watch reports; the 2-message request limit already stops most mass-messaging from new accounts.
+- A user could try to open another browser profile to send more than 2 request messages; the limit is enforced by the Firestore rules per conversation (`reqCount`), but a banned or fresh account can start new conversations. Ban abusers from **Admin**.
+- Pictures are not scanned automatically. Review reports, and consider a moderation API before going public.
+- I could not run the Firebase Emulator in my environment. Test the new rules with the Emulator Suite or with two real accounts (one male, one female, verified) before launch.
