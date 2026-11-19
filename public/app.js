@@ -585,7 +585,7 @@ async function pageChat(uid) {
   render(`<div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <h3 style="margin:0">${partnerIsGuest ? esc(p.name) : `<a href="#/profile/${esc(uid)}">${esc(p.name)}</a>`}</h3>
-      <span class="muted">Chats may be reviewed by moderators for safety.</span></div>
+      </div>
     <div class="thread" id="thread"></div>
     <form id="send" class="sendbar"><textarea name="body" required maxlength="2000" placeholder="Write a message…"></textarea>
     <button type="submit">Send</button></form>
@@ -696,7 +696,7 @@ async function pageRandom() {
     <p>Get connected to a random, anonymous <b>${wantLabel === "a woman" ? "woman" : "man"}</b> who is also looking right now. No names, no photos, just conversation.
     If the vibe is good, keep talking. If not, tap <b>Next</b>.</p>
     ${note ? `<div class="flash warn">${esc(note)}</div>` : ""}
-    <div class="notice">Be respectful. Never share contact details or money. Chats are stored and may be reviewed by moderators; use <b>Report</b> if someone crosses a line.</div>
+    <div class="notice">Be respectful. Never share contact details or money. Use <b>Report</b> if someone crosses a line.</div>
     <button id="start">Find someone</button></div>`);
   const bindIdle = () => { el("start").onclick = startSearch; };
 
@@ -713,7 +713,7 @@ async function pageRandom() {
     render(`<div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
         <h3 style="margin:0">&#127917; Stranger <span class="badge">${strangerLabel}</span></h3>
-        <span class="muted">Anonymous. Chats may be reviewed by moderators.</span></div>
+        <span class="muted">Anonymous</span></div>
       <div class="thread" id="thread"></div>
       <form id="send" class="sendbar"><textarea name="body" required maxlength="1000" placeholder="Say hi…"></textarea><button type="submit">Send</button></form>
       <div class="btnrow"><button id="next">Next &#8594;</button><button class="ghost" id="report">Report</button><button class="ghost" id="leave">Leave</button></div></div>`);
@@ -931,7 +931,7 @@ async function pageLobby() {
   render(`<div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
       <h3 style="margin:0">Public lobby</h3>
-      <span class="muted">Open to guests and members. Moderated; messages may be reviewed. Never share personal contact details.</span></div>
+      <span class="muted">Open to guests and members. Never share personal contact details.</span></div>
     <div class="thread" id="thread"></div>
     ${canPost ? `<form id="send" class="sendbar"><textarea name="body" required maxlength="500" placeholder="Write a message…"></textarea>
       <button type="submit">Send</button></form>` : '<p class="muted">Read-only.</p>'}</div>`);
